@@ -200,7 +200,8 @@ def _cmd_migrate_floorvault(args) -> None:
     if not result["verified"]:
         c.print("[red]Verification failed:[/] the FloorVault copy does not match; the Fernet vault is untouched.")
         return
-    c.print("[green]Verified[/]: every item reads back identical from FloorVault.")
+    c.print("[green]Verified[/]: every item reads back identical from FloorVault "
+            "[dim](created_at shows the migration time — the original timestamps do not carry over).[/]")
     from hermes_cli.config import _ensure_dict, load_config, save_config
 
     cfg = load_config()
@@ -213,7 +214,8 @@ def _cmd_migrate_floorvault(args) -> None:
         c.print("Removed vault.json.enc and vault.key.")
     else:
         c.print("[dim]vault.json.enc and vault.key were left in place; rerun with --remove-legacy "
-                "to delete them (the key file decrypts the old copy).[/]")
+                "to delete them (the key file decrypts the old copy). While they remain you can "
+                "revert with `hermes config set vault.store fernet`.[/]")
 
 
 def register_cli(subparser) -> None:

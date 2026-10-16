@@ -21,13 +21,15 @@ keep working.
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
-from agent.vault_store import VaultError, VaultItemMeta, VaultStore
+from agent.vault_store import VAULT_KINDS, VaultError, VaultItemMeta, VaultStore
 
 APP_INSTANCE_ID = "hermes-agent"
 KEYRING_SERVICE = "hermes-agent-vault"
@@ -48,16 +50,17 @@ def _as_vault_error() -> Iterator[None]:
     except DecryptionVerificationError as exc:
         raise VaultError("vault item failed authentication (tampered, moved, or wrong key)") from exc
     except KeyProviderError as exc:
-        raise VaultError(
-            "FloorVault master key unavailable: no OS key store (Keychain, DPAPI, Secret Service) is "
-            "usable and FLOOR_VAULT_KEY is not set. On a headless host, export FLOOR_VAULT_KEY as 64 "
-            "hex characters, the same value every run, or the vault cannot be decrypted.") from exc
+        # str(exc) names the real cause (a malformed FLOOR_VAULT_KEY, a missing platform
+        # custody extra); rewording it would point the user at the wrong fix.
+        raise VaultError(f"FloorVault master key unavailable: {exc}") from exc
     except (FloorVaultStoreError, FloorVaultError) as exc:
         raise VaultError(str(exc)) from exc
     except sqlite3.IntegrityError as exc:
-        raise VaultError("a vault item with that id already exists") from exc
+        raise VaultError(f"vault write violated a constraint (duplicate id or missing field): {exc}") from exc
     except sqlite3.Error as exc:
         raise VaultError(f"vault database error: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise VaultError("vault item payload is corrupted (invalid JSON)") from exc
 
 
 def _require_floorvault() -> None:
@@ -94,9 +97,19 @@ class FloorVaultStore:
                 key = AdaptiveKeyProvider(service_name=KEYRING_SERVICE, fallback_dir=self._base).resolve_key()
                 crypto = FloorVault(key, app_instance_id=APP_INSTANCE_ID)
             self._store = _Store(self._base, crypto=crypto)
+        # sqlite3.connect creates vault.db under the process umask; tighten to the vault
+        # convention (0600, like vault.key). The 0700 parent dir already shields it.
+        try:
+            os.chmod(self._base / "vault.db", 0o600)
+        except OSError:
+            pass
 
     def add_item(self, kind: str, label: str, secret: dict[str, Any], origin: Optional[str] = None,
                  *, item_id: Optional[str] = None) -> VaultItemMeta:
+        # Gate on the Hermes kind set: floorvault also accepts "generic", which would create
+        # an item the Fernet store could never write — a ghost if the user ever reverts.
+        if kind not in VAULT_KINDS:
+            raise VaultError(f"unknown vault kind {kind!r} (expected one of {VAULT_KINDS})")
         with _as_vault_error():
             return _convert(self._store.add_item(kind, label, dict(secret), origin, item_id=item_id))
 
@@ -105,8 +118,11 @@ class FloorVaultStore:
             return [_convert(m) for m in self._store.list_items()]
 
     def has_items(self) -> bool:
-        with _as_vault_error():
-            return self._store.has_items()
+        try:
+            with _as_vault_error():
+                return self._store.has_items()
+        except Exception:  # health: allow BLE001 -- Fernet contract: any failure reads as "empty", never raises
+            return False
 
     def remove_item(self, item_id: str) -> bool:
         with _as_vault_error():
@@ -145,19 +161,25 @@ def migrate_from_fernet(legacy: VaultStore, target: FloorVaultStore) -> dict[str
     """Copy every item of a Fernet vault into *target*, keeping each item's id so existing
     ``vault_…`` handles keep resolving. Idempotent: ids already in *target* are skipped. Every
     copied item is read back and compared before reporting success. The legacy files are never
-    modified; removing them is the caller's decision once ``verified`` is True."""
+    modified; removing them is the caller's decision once ``verified`` is True.
+
+    The legacy lock is held across the whole copy+verify so a concurrent ``vault add``
+    cannot land between the read and the caller's ``vault.store`` flip and be stranded in
+    a vault that is no longer selected. ``created_at`` is the one field that cannot be
+    carried over — floorvault mints it on insert — so migrated items report the migration
+    time, not the original creation time."""
     with legacy._locked():
         records = legacy._read_all()
-    present = {m.id for m in target.list_items()}
-    copied = skipped = 0
-    for rec in records:
-        if rec.get("id") in present:
-            skipped += 1
-            continue
-        target.add_item(str(rec.get("kind")), str(rec.get("label") or ""), _legacy_login_secret(rec),
-                        rec.get("origin"), item_id=str(rec.get("id")))
-        copied += 1
-    verified = all(_matches(target, rec) for rec in records)
+        present = {m.id for m in target.list_items()}
+        copied = skipped = 0
+        for rec in records:
+            if rec.get("id") in present:
+                skipped += 1
+                continue
+            target.add_item(str(rec.get("kind")), str(rec.get("label") or ""), _legacy_login_secret(rec),
+                            rec.get("origin"), item_id=str(rec.get("id")))
+            copied += 1
+        verified = all(_matches(target, rec) for rec in records)
     return {"total": len(records), "copied": copied, "skipped": skipped, "verified": verified}
 
 
@@ -165,6 +187,10 @@ def _matches(target: FloorVaultStore, rec: dict[str, Any]) -> bool:
     meta = target.get_meta(str(rec.get("id")))
     if meta is None or meta.kind != rec.get("kind") or meta.origin != rec.get("origin"):
         return False
+    if meta.label != str(rec.get("label") or "").strip():
+        return False
     if meta.identifier != (rec.get("identifier") or None):
+        return False
+    if meta.identifier_type != (rec.get("identifier_type") or None):
         return False
     return target.resolve_secret(meta.id) == {k: str(v) for k, v in (rec.get("secret") or {}).items()}

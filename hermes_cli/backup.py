@@ -159,10 +159,10 @@ _ZIP_MEMBER_READ_ERRORS: tuple[type[BaseException], ...] = (
     zipfile.BadZipFile, zlib.error, EOFError, *_LZMA_ERRORS)
 
 # zipfile.open() drops Unix mode bits on extract; restore tightens these to 0600.
-# vault.key / vault.json.enc / vault.db (FloorVault; its key stays in the OS key store): the local
+# vault.key / vault.json.enc / vault.db (+ FloorVault's master.key.* custody blobs): the local
 # credential vault IS included in backups (user-entered secrets, not regenerable — unlike the
 # excluded browser-profile/ snapshot) but must come back owner-only.
-_SECRET_FILE_NAMES = {".env", "auth.json", "state.db", "vault.key", "vault.json.enc", "vault.db"}
+_SECRET_FILE_NAMES = {".env", "auth.json", "state.db", "vault.key", "vault.json.enc", "vault.db", "master.key.dpapi", "master.key.ss"}
 
 # Reserved archive subtree for memory-provider state OUTSIDE HERMES_HOME (e.g. ~/.honcho, via
 # MemoryProvider.backup_paths()), stored and restored relative to the user's home; paths not

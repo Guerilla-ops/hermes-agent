@@ -92,6 +92,45 @@ def test_env_key_override(tmp_path, monkeypatch):
     assert FloorVaultStore(tmp_path / "vault").resolve_secret(item.id)["password"] == "hunter2-pw"
 
 
+def test_malformed_env_key_reports_the_real_cause(tmp_path, monkeypatch):
+    # A set-but-malformed key must not read back as "is not set": the mapped
+    # VaultError keeps floorvault's own message, which names the fix.
+    monkeypatch.delenv("APPSTATE_KEY", raising=False)
+    monkeypatch.delenv("VAULT_MASTER_KEY", raising=False)
+    monkeypatch.setenv("FLOOR_VAULT_KEY", "not-hex")
+    with pytest.raises(VaultError, match="64 hexadecimal"):
+        FloorVaultStore(tmp_path / "vault")
+
+
+def test_generic_kind_is_rejected(tmp_path):
+    # floorvault accepts a 4th kind ("generic") the Fernet store never writes;
+    # letting it through would strand a ghost item if the user reverts.
+    store = _store(tmp_path / "vault")
+    with pytest.raises(VaultError, match="unknown vault kind"):
+        store.add_item("generic", "G", {"anything": "goes"})
+
+
+def test_has_items_swallows_failures_like_fernet(tmp_path, monkeypatch):
+    store = _store(tmp_path / "vault")
+    monkeypatch.setattr(store._store, "has_items",
+                        lambda: (_ for _ in ()).throw(Exception("db gone")))
+    assert store.has_items() is False
+
+
+@pytest.mark.platforms("posix")
+def test_vault_db_is_owner_only(tmp_path):
+    _store(tmp_path / "vault")
+    import stat
+    assert stat.S_IMODE((tmp_path / "vault" / "vault.db").stat().st_mode) == 0o600
+
+
+def test_vault_store_key_is_a_known_config_key():
+    # Without the registry entry, `hermes config set/get vault.store` warns the
+    # key is unrecognized even though the runtime reads it.
+    from hermes_cli.config import _validate_config_key
+    assert _validate_config_key("vault.store") == (True, None)
+
+
 def test_config_selects_store(tmp_path, monkeypatch):
     import agent.vault_store as vs
     import agent.vault_store_floorvault as fv
@@ -134,5 +173,14 @@ def test_migration_reports_mismatch(tmp_path):
     login = legacy.add_item("login", "Example", dict(LOGIN), origin="https://example.com")
     target = _store(tmp_path / "vault")
     target.add_item("login", "Example", {**LOGIN, "password": "different"}, origin="https://example.com",
+                    item_id=login.id)
+    assert migrate_from_fernet(legacy, target)["verified"] is False
+
+
+def test_migration_detects_label_mismatch(tmp_path):
+    legacy = VaultStore(tmp_path / "vault")
+    login = legacy.add_item("login", "Example", dict(LOGIN), origin="https://example.com")
+    target = _store(tmp_path / "vault")
+    target.add_item("login", "Different label", dict(LOGIN), origin="https://example.com",
                     item_id=login.id)
     assert migrate_from_fernet(legacy, target)["verified"] is False
