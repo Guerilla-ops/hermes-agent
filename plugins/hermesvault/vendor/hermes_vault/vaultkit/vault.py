@@ -6,11 +6,16 @@ application-level search index.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+import secrets
 import sqlite3
+import threading
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +60,19 @@ REQUIRED_FIELDS = {
 }
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _require_envelope_key_id(key_id: int) -> None:
+    """A key generation persisted anywhere must fit the envelope's u8 field.
+
+    Journal and state rows name a generation the record format has to be able
+    to express; an out-of-range or wrongly-typed value would persist rotation
+    metadata no envelope can carry. Same contract as ``FloorVault.encrypt``.
+    """
+    if isinstance(key_id, bool) or not isinstance(key_id, int):
+        raise TypeError("key_id must be an integer")
+    if not 0 <= key_id <= 255:
+        raise ValueError("key_id must be in [0, 255]")
 
 
 class VaultError(Exception):
@@ -191,14 +209,42 @@ class VaultItemMeta:
 
 
 class VaultStore:
-    """floorvault-backed vault store backed by FloorVault."""
+    """hermes_vault-backed vault store backed by FloorVault.
 
-    def __init__(self, base_dir: Path | str, *, crypto: Optional[FloorVault] = None):
+    Storage leakage contract: every secret payload and all descriptive
+    metadata (label, origin, identifier_login/url, created_at) is sealed
+    under contextual AAD. ``id``, ``kind``, ``has_otp`` and
+    ``decommissioned_at`` stay cleartext columns so item listings, OTP status
+    and tombstoning stay queryable without decrypting every row - an observer
+    of the file therefore learns item count, ids and kinds, but nothing that
+    identifies or reconstructs a secret. Callers for whom even item kinds are
+    sensitive should encrypt them into the metadata JSON instead (at the cost
+    of losing indexed listings), not widen this schema.
+    """
+
+    _SCHEMA_VERSION = 3
+
+    def __init__(
+        self,
+        base_dir: Path | str,
+        *,
+        crypto: Optional[FloorVault] = None,
+        migrate_legacy_metadata: bool = False,
+    ):
         self._base = Path(base_dir)
         _mkdir_owner_only(self._base)
         self._db_path = self._base / "vault.db"
         self._legacy_vault_path = self._base / "vault.json.enc"
         self._legacy_key_path = self._base / "vault.key"
+        self._allow_plaintext_migration = migrate_legacy_metadata
+        # Serializes in-process DB access. Each operation opens its own
+        # connection and begins a transaction immediately, so concurrent
+        # callers queue on SQLite's write lock inside a finite busy timeout —
+        # on slow filesystems (Windows CI) deep queues exceed it and surface
+        # as "database is locked". A store is a per-process object; holding
+        # the lock for the whole transaction makes in-process ordering
+        # deterministic while SQLite still guards cross-process writers.
+        self._io_lock = threading.Lock()
 
         if crypto is not None:
             self._crypto = crypto
@@ -206,6 +252,7 @@ class VaultStore:
             provider = AdaptiveKeyProvider(
                 service_name="hermes-agent-vault",
                 fallback_dir=self._base,
+                allow_legacy_env_vars=True,
             )
             master_key = provider.resolve_key()
             self._crypto = FloorVault(master_key, app_instance_id="hermes-agent")
@@ -214,6 +261,12 @@ class VaultStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if user_version > self._SCHEMA_VERSION:
+                raise VaultError(
+                    f"unsupported vault schema version {user_version}; "
+                    f"maximum supported is {self._SCHEMA_VERSION}"
+                )
             conn.execute("PRAGMA secure_delete = ON")
             conn.execute("PRAGMA journal_mode = DELETE")
             conn.execute("PRAGMA synchronous = FULL")
@@ -261,7 +314,9 @@ class VaultStore:
                 CREATE TABLE IF NOT EXISTS vault_rotation_state (
                     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                     active INTEGER NOT NULL CHECK (active IN (0, 1)),
-                    target_key_id INTEGER NOT NULL
+                    target_key_id INTEGER NOT NULL,
+                    target_commitment BLOB,
+                    store_nonce BLOB
                 )
             """)
             conn.execute("""
@@ -271,30 +326,54 @@ class VaultStore:
             """)
             self._migrate_plaintext_metadata(conn)
             self._remove_origin_index(conn)
-            conn.execute("PRAGMA user_version = 2")
+            self._ensure_rotation_commitment_column(conn)
+            conn.execute(f"PRAGMA user_version = {self._SCHEMA_VERSION}")
 
-    def _connect(self) -> sqlite3.Connection:
-        """Open a connection with residue-reduction pragmas applied."""
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Open a transaction-scoped connection that is always closed.
+
+        ``sqlite3.Connection`` as a context manager commits or rolls back but
+        never closes, so ``with conn`` alone leaks the handle to GC. Wrap both
+        boundaries here: the inner ``with conn`` preserves commit/rollback
+        semantics, the ``finally`` closes the descriptor.
+        """
         conn = sqlite3.connect(self._db_path)
-        conn.execute("PRAGMA secure_delete = ON")
-        conn.execute("PRAGMA journal_mode = DELETE")
-        conn.execute("PRAGMA synchronous = FULL")
-        return conn
+        try:
+            conn.execute("PRAGMA secure_delete = ON")
+            conn.execute("PRAGMA journal_mode = DELETE")
+            conn.execute("PRAGMA synchronous = FULL")
+            with self._io_lock:
+                with conn:
+                    yield conn
+        finally:
+            conn.close()
 
     def _migrate_plaintext_metadata(self, conn: sqlite3.Connection) -> None:
-        """Encrypt legacy metadata rows while preserving their public API."""
+        """Encrypt legacy metadata rows while preserving their public API.
+
+        Plaintext in these columns is only legitimate in a pre-migration store
+        during a controlled upgrade. The on-disk ``user_version`` marker cannot
+        authorize accepting it: a database writer could reset the marker, plant
+        plaintext, and have the next ordinary open reseal it under the real
+        key. Normal opens therefore reject any string-typed metadata outright;
+        resealing requires ``migrate_legacy_metadata=True`` at construction.
+        """
         rows = conn.execute(
             "SELECT id, label, origin, identifier_type, identifier, created_at FROM vault_items"
         ).fetchall()
-        already_migrated = conn.execute("PRAGMA user_version").fetchone()[0] >= 1
         for item_id, label, origin, identifier_type, identifier, created_at in rows:
-            if already_migrated and any(
-                isinstance(value, str)
-                for value in (label, origin, identifier_type, identifier, created_at)
-            ):
-                raise VaultError("plaintext metadata detected after migration")
-            if not isinstance(label, str) or not isinstance(created_at, str):
+            values = (label, origin, identifier_type, identifier, created_at)
+            if not any(isinstance(value, str) for value in values):
                 continue
+            if not self._allow_plaintext_migration:
+                raise VaultError(
+                    "plaintext metadata detected; refusing to open. If this is a "
+                    "verified legacy store, construct VaultStore with "
+                    "migrate_legacy_metadata=True once, then remove the flag"
+                )
+            if not all(value is None or isinstance(value, str) for value in values):
+                raise VaultError("mixed plaintext/encrypted metadata; refusing legacy migration")
             conn.execute(
                 """
                 UPDATE vault_items
@@ -341,6 +420,23 @@ class VaultStore:
         conn.execute("DROP TABLE vault_items")
         conn.execute("ALTER TABLE vault_items_without_origin_idx RENAME TO vault_items")
 
+    def _ensure_rotation_commitment_column(self, conn: sqlite3.Connection) -> None:
+        """Add the target-commitment and store-nonce columns to older stores."""
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(vault_rotation_state)")}
+        if "target_commitment" not in columns:
+            conn.execute("ALTER TABLE vault_rotation_state ADD COLUMN target_commitment BLOB")
+        if "store_nonce" not in columns:
+            conn.execute("ALTER TABLE vault_rotation_state ADD COLUMN store_nonce BLOB")
+        # The per-store nonce is what makes a rotation commitment unique to
+        # THIS database: two stores with identical record ids still produce
+        # different commitments, so an envelope transplanted between them
+        # cannot authenticate. Minted once, then sticky.
+        conn.execute(
+            "UPDATE vault_rotation_state SET store_nonce = ? "
+            "WHERE singleton = 1 AND store_nonce IS NULL",
+            (secrets.token_bytes(32),),
+        )
+
     def _encrypt_metadata(self, item_id: str, column: str, value: Optional[str]) -> Optional[bytes]:
         if value is None:
             return None
@@ -368,19 +464,101 @@ class VaultStore:
         if row is not None and bool(row[0]):
             raise VaultError("vault rotation is in progress; write refused")
 
-    def begin_rotation(self, target_key_id: int) -> None:
-        """Persist the rotation write barrier before taking a source snapshot."""
+    def begin_rotation(self, target_key_id: int, *, target_vault: FloorVault) -> None:
+        """Persist the rotation write barrier before taking a source snapshot.
+
+        Resuming is bound to the target key GENERATION, not just its id: the
+        barrier records a commitment sealed under ``target_vault``, and a resume
+        must authenticate it before any record is re-sealed. A caller presenting
+        the same ``target_key_id`` under a different master key - or a different
+        application instance - is refused here instead of being discovered only
+        at final verification, after the remaining records were moved onto the
+        wrong key.
+        """
+        if not isinstance(target_vault, FloorVault):
+            raise TypeError("target_vault must be a FloorVault")
+        _require_envelope_key_id(target_key_id)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT active, target_key_id FROM vault_rotation_state WHERE singleton = 1"
+                "SELECT active, target_key_id, target_commitment FROM vault_rotation_state "
+                "WHERE singleton = 1"
             ).fetchone()
-            if row is not None and bool(row[0]) and int(row[1]) != target_key_id:
-                raise VaultError("another vault rotation is already in progress")
-            conn.execute(
-                "UPDATE vault_rotation_state SET active = 1, target_key_id = ? WHERE singleton = 1",
-                (target_key_id,),
+            if row is not None and bool(row[0]):
+                if int(row[1]) != target_key_id:
+                    raise VaultError("another vault rotation is already in progress")
+                self._verify_rotation_target(conn, row[2], target_vault, target_key_id)
+                return
+            commitment = target_vault.encrypt(
+                self._rotation_commitment_payload(conn),
+                key_id=target_key_id,
+                table=self._ROTATION_COMMITMENT_TABLE,
+                record_id=self._ROTATION_COMMITMENT_RECORD_ID,
+                column=self._ROTATION_COMMITMENT_COLUMN,
             )
+            conn.execute(
+                "UPDATE vault_rotation_state "
+                "SET active = 1, target_key_id = ?, target_commitment = ? WHERE singleton = 1",
+                (target_key_id, commitment),
+            )
+
+    def _rotation_commitment_payload(self, conn: sqlite3.Connection) -> bytes:
+        """The canary bound to this store's identity and record-id universe.
+
+        A bare constant sealed under the target vault verifies for ANY store
+        the envelope is transplanted into, because the plaintext and its AAD
+        coordinates are public constants. Binding the store's random
+        ``store_nonce`` plus its content fingerprint inside the commitment
+        means an envelope sealed for one vault database can never
+        authenticate a rotation on another - even one holding identical
+        record ids.
+        """
+        nonce_row = conn.execute(
+            "SELECT store_nonce FROM vault_rotation_state WHERE singleton = 1"
+        ).fetchone()
+        fingerprint = hashlib.sha256()
+        fingerprint.update(b"nonce:" + (bytes(nonce_row[0]) if nonce_row and nonce_row[0] else b""))
+        ids = sorted(
+            [row[0] for row in conn.execute("SELECT id FROM vault_items")]
+            + [row[0] for row in conn.execute("SELECT legacy_id FROM vault_legacy_retirements")]
+        )
+        for record_id in ids:
+            encoded = str(record_id).encode("utf-8", errors="surrogatepass")
+            fingerprint.update(str(len(encoded)).encode("ascii") + b":" + encoded)
+        return self._ROTATION_COMMITMENT_CANARY + fingerprint.digest()
+
+    def _verify_rotation_target(
+        self, conn: sqlite3.Connection, stored: Any, target_vault: FloorVault, target_key_id: int
+    ) -> None:
+        """Fail closed unless ``target_vault`` reads the recorded commitment.
+
+        The commitment is an ordinary envelope sealed under the vault that began
+        the rotation: reading it back proves the resuming caller holds that same
+        key generation (same master key, same application instance, same key
+        id), which a bare ``target_key_id`` cannot, and the bound store
+        fingerprint proves the rotation was begun on THIS database.
+        """
+        if stored is None:
+            raise VaultError(
+                "in-flight rotation predates target-key commitment binding and "
+                "cannot be verified against this master key; inspect the "
+                "journal and clear it explicitly once the store is verified"
+            )
+        try:
+            canary = target_vault.decrypt_bytes(
+                bytes(stored),
+                key_id=target_key_id,
+                table=self._ROTATION_COMMITMENT_TABLE,
+                record_id=self._ROTATION_COMMITMENT_RECORD_ID,
+                column=self._ROTATION_COMMITMENT_COLUMN,
+            )
+        except FloorVaultError as exc:
+            raise VaultError(
+                "rotation resume presented a different target master key than the "
+                "one the in-flight rotation committed to; refusing before any write"
+            ) from exc
+        if canary != self._rotation_commitment_payload(conn):
+            raise VaultError("rotation commitment did not authenticate to the expected value")
 
     def add_item(
         self,
@@ -587,6 +765,7 @@ class VaultStore:
         target_key_id: int,
     ) -> None:
         """Record rotation progress on ``conn`` (same transaction as the write)."""
+        _require_envelope_key_id(target_key_id)
         for kind, record_id, column in rows or ():
             conn.execute(
                 """
@@ -623,7 +802,10 @@ class VaultStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("DELETE FROM vault_rotation_journal")
-            conn.execute("UPDATE vault_rotation_state SET active = 0 WHERE singleton = 1")
+            conn.execute(
+                "UPDATE vault_rotation_state SET active = 0, target_commitment = NULL "
+                "WHERE singleton = 1"
+            )
 
     def read_sealed_item(self, item_id: str, ring: KeyRing) -> dict[str, Any]:
         """Return one item's plaintext as sealed today, read through ``ring``.
@@ -772,6 +954,21 @@ class VaultStore:
     #: every one of them; keeping the list here means adding a column later
     #: cannot leave rotation silently behind.
     _SEALED_META_COLUMNS = ("label", "origin", "identifier_type", "identifier", "created_at")
+
+    #: Rotation-resume commitment: a canary sealed under the target vault and
+    #: stored in ``vault_rotation_state.target_commitment`` when a rotation
+    #: begins. The sealed payload is the canary concatenated with a SHA-256
+    #: fingerprint of the store's record-id universe, so the envelope
+    #: authenticates only for the database it was sealed against - an envelope
+    #: transplanted into another vault store fails the resume check even under
+    #: the same target key. Resuming therefore binds to the target key
+    #: generation (master key + application instance + key id) AND this store,
+    #: rather than the 1-byte id alone. The coordinates name a slot no real
+    #: record can occupy.
+    _ROTATION_COMMITMENT_TABLE = "vault_rotation_state"
+    _ROTATION_COMMITMENT_RECORD_ID = "target"
+    _ROTATION_COMMITMENT_COLUMN = "commitment"
+    _ROTATION_COMMITMENT_CANARY = b"hermes_vault-rotation-target-v1"
 
     def _write_tombstone(
         self,

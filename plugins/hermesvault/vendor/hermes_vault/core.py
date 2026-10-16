@@ -9,6 +9,7 @@ from __future__ import annotations
 import collections
 import json
 import os
+import re
 import threading
 from typing import Any, Mapping, Union
 
@@ -76,14 +77,107 @@ def envelope_header(ciphertext: bytes) -> dict[str, Any]:
     return header
 
 
+def _parse_envelope(
+    ciphertext: bytes,
+) -> tuple[memoryview | None, int | None, int | None, memoryview, memoryview]:
+    """Parse an envelope of either version (SPEC §4.3, in document order).
+
+    Returns ``(header, crypto_version, key_id, nonce, raw_ciphertext)``,
+    where ``header``, ``crypto_version`` and ``key_id`` are ``None`` for a
+    v1 envelope, which carries neither.
+
+    Header, nonce and raw ciphertext are returned as ``memoryview`` slices
+    of the caller's buffer — the AEAD accepts buffer objects directly, so
+    parsing no longer copies the payload on every decrypt (an O(n) copy
+    per record before). A ``bytearray`` input is mutable, so it is
+    snapshotted once to ``bytes`` first and the views alias the snapshot.
+
+    Package-private: adapters use this for full structural validation —
+    ``envelope_header`` only proves the header parses, so a bare magic
+    prefix would survive it while still being undecryptable garbage.
+    """
+    if not isinstance(ciphertext, (bytes, bytearray)):
+        raise TypeError("Ciphertext must be bytes")
+    if len(ciphertext) < 5 + _NONCE_LEN:
+        raise DecryptionVerificationError("Malformed ciphertext envelope: too short")
+
+    if isinstance(ciphertext, bytearray):
+        # Mutable input: a memoryview would alias the caller's buffer, so a
+        # concurrent mutation could change the key_id or nonce between the
+        # header checks and the AEAD call. One snapshot keeps every view
+        # below over immutable bytes; bytes input stays zero-copy.
+        ciphertext = bytes(ciphertext)
+    view = memoryview(ciphertext)
+    magic = view[:4]
+    if magic in (RECORD_MAGIC_V2, b"FLV2"):
+        crypto_version = view[4]
+        if crypto_version != CRYPTO_VERSION:
+            raise DecryptionVerificationError(
+                f"Unsupported envelope crypto version {crypto_version} "
+                f"(this build writes {CRYPTO_VERSION})"
+            )
+        header = view[:_HEADER_LEN_V2]
+        key_id = view[5]
+        offset = _HEADER_LEN_V2
+    elif magic in (RECORD_MAGIC, b"FLRV"):
+        header = crypto_version = key_id = None
+        offset = 5
+    else:
+        raise DecryptionVerificationError("Invalid ciphertext magic header")
+
+    nonce_len = view[offset - 1]
+    if nonce_len != _NONCE_LEN or len(view) < offset + nonce_len:
+        raise DecryptionVerificationError("Invalid nonce length in ciphertext envelope")
+
+    nonce = view[offset : offset + nonce_len]
+    raw_cipher = view[offset + nonce_len :]
+    if not raw_cipher:
+        raise DecryptionVerificationError("Malformed ciphertext envelope: no ciphertext")
+    return header, crypto_version, key_id, nonce, raw_cipher
+
+
 def canonical_json_bytes(data: Mapping[str, Any]) -> bytes:
     """Serialize dictionary to deterministic, canonical UTF-8 JSON bytes."""
-    return json.dumps(
-        data,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    try:
+        return json.dumps(
+            data,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            "AAD coordinates must be UTF-8 encodable; lone surrogates are refused"
+        ) from exc
+
+
+# Characters json.dumps(ensure_ascii=False) escapes inside a JSON string:
+# double-quote, backslash, and the C0 controls. Everything else is verbatim.
+_JSON_UNSAFE = re.compile(r'[\\"\x00-\x1f]')
+
+
+def _quote_json(value: str) -> bytes:
+    """JSON string literal for ``value``, byte-identical to ``json.dumps``.
+
+    The key order of the AAD payload is fixed, so the per-op hot path builds
+    the object literally instead of round-tripping a dict through
+    ``json.dumps(sort_keys=True)``. When the value contains nothing JSON must
+    escape (the common case) it is quoted directly; otherwise it falls back to
+    ``json.dumps`` for the exact escaping rules, so output can never diverge
+    from :func:`associated_data`.
+    """
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # A lone surrogate cannot be UTF-8-encoded. Refuse it as the documented
+        # caller error - both here and on the json.dumps path, where it would
+        # otherwise be silently emitted as a \ud800 escape.
+        raise ValueError(
+            "AAD coordinates must be UTF-8 encodable; lone surrogates are refused"
+        ) from exc
+    if _JSON_UNSAFE.search(value) is None:
+        return b'"' + encoded + b'"'
+    return json.dumps(value, ensure_ascii=False).encode("utf-8")
 
 
 def associated_data(
@@ -91,9 +185,9 @@ def associated_data(
     table: str,
     record_id: str,
     column: str,
-    schema_id: str = "floor.vault.v1",
+    schema_id: str = "hermes.vault.v1",
     schema_version: int = 1,
-    app_instance_id: str = "default",
+    app_instance_id: str = "hermes-agent",
     revision: int | None = None,
 ) -> bytes:
     """Construct canonical Associated Authenticated Data (AAD) binding block.
@@ -154,11 +248,16 @@ class FloorVault:
         wipe_source_key: bool = False,
         hkdf_info: bytes = b"hermes-v1-aes-siv",
     ) -> None:
-        """Initialize HermesVault / FloorVault.
+        """Initialize FloorVault.
 
         Derives isolated subkeys from the master key. The master key handle
         is preserved by default; set ``wipe_source_key=True`` to zero the
         caller-provided source key after derivation.
+
+        Construction is deliberately heavyweight — HKDF derivation plus the
+        hardened memory container cost tens of microseconds — so callers
+        should create one instance per master key and reuse it for the life of
+        the process rather than constructing one per operation.
         """
         if not isinstance(app_instance_id, str) or not app_instance_id.strip():
             raise ValueError("app_instance_id must be a non-empty string")
@@ -173,13 +272,22 @@ class FloorVault:
         # failure path can run, otherwise __del__/wipe() raise AttributeError
         # on a partially initialised instance and leave the engine unclosed.
         self._max_nonces = maximum_tracked_nonces
-        self._lock = threading.Lock()
-        self._nonce_queue: collections.deque[bytes] = collections.deque(
-            maxlen=max(1, maximum_tracked_nonces)
-        )
+        # RLock, not Lock: the closed-check, engine snapshot and nonce dedup run
+        # inside one section, and a wipe() reached through the _track_nonce seam
+        # (the regression test does exactly this) must be able to re-enter
+        # without deadlocking the in-flight operation.
+        self._lock = threading.RLock()
+        # deque+set, not a plain dict: evicting the oldest nonce from a dict
+        # via pop(next(iter(d))) is O(window size) at steady state because the
+        # iterator skips the tombstone front; deque popleft + set discard are
+        # true O(1). (Measured: 6.9us per track vs ~0.2us.)
+        self._nonce_queue: collections.deque[bytes] = collections.deque()
         self._nonce_set: set[bytes] = set()
         self._aead_siv: Any = None
         self._siv_key: Any = None
+        # Constant prefix of the canonical AAD object; the remaining keys are
+        # emitted in sorted order by _aad().
+        self._ad_prefix = b'{"app_instance_id":' + _quote_json(app_instance_id) + b',"column":'
 
         # 1. Extract the source key as a mutable or zero-copy buffer
         master_buffer: bytearray | memoryview
@@ -212,15 +320,16 @@ class FloorVault:
                 length=64,
                 salt=None,
                 info=hkdf_info,
-            ).derive(bytes(master_buffer))
+            ).derive(master_buffer)
 
             # 3. Pin derived subkeys into physical RAM containers
             self._siv_key = HardenedMemoryKey(raw_siv, mode=memory_mode)
 
-            # Initialize AES-SIV engine
-            siv_key_bytes = self._siv_key.get_bytes()
-            self._aead_siv = AESSIV(siv_key_bytes)
-            del siv_key_bytes
+            # Initialize AES-SIV engine straight from the locked buffer: a
+            # get_bytes() copy would leave an un-wipeable immutable ghost on
+            # the Python heap. (The engine's own internal copy is made inside
+            # the cryptography library regardless - see wipe().)
+            self._aead_siv = AESSIV(self._siv_key.get_buffer())
             del raw_siv
 
         finally:
@@ -239,25 +348,102 @@ class FloorVault:
         # Bounded sliding window for observed nonces (allocated earlier so that
         # failure paths and __del__ always find them present).
 
+    @staticmethod
+    def _validate_aad_mid(
+        table: str,
+        record_id: str,
+        schema_id: str,
+        schema_version: int,
+        revision: int | None,
+    ) -> bytes:
+        """Validate the record-constant AAD params and return the mid section.
+
+        Shared validation for the record coordinates so a batch call checks
+        them once instead of once per field. Byte-identical ordering to the
+        ``associated_data`` payload: record_id, revision?, schema_id,
+        schema_version, table.
+        """
+        for name, val in [
+            ("table", table),
+            ("record_id", record_id),
+            ("schema_id", schema_id),
+        ]:
+            if not isinstance(val, str) or not val.strip():
+                raise ValueError(f"AAD parameter {name!r} must be a non-empty string")
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            raise TypeError("AAD parameter 'schema_version' must be an integer")
+        if revision is not None:
+            if isinstance(revision, bool) or not isinstance(revision, int):
+                raise TypeError("AAD parameter 'revision' must be a non-negative integer")
+            if revision < 0:
+                raise ValueError("AAD parameter 'revision' must be a non-negative integer")
+        return (
+            b',"record_id":'
+            + _quote_json(record_id)
+            + (b',"revision":' + int.__repr__(revision).encode() if revision is not None else b"")
+            + b',"schema_id":'
+            + _quote_json(schema_id)
+            + b',"schema_version":'
+            + int.__repr__(schema_version).encode()
+            + b',"table":'
+            + _quote_json(table)
+        )
+
+    def _aad(
+        self,
+        *,
+        table: str,
+        record_id: str,
+        column: str,
+        schema_id: str,
+        schema_version: int,
+        revision: int | None,
+        _mid: bytes | None = None,
+    ) -> bytes:
+        """Canonical AAD block, byte-identical to :func:`associated_data`.
+
+        The payload's six keys have a fixed sorted order
+        (``app_instance_id``, ``column``, ``record_id``, ``revision``,
+        ``schema_id``, ``schema_version``, ``table``), so the hot path emits
+        them literally: a constant prefix bound at construction, then the
+        per-record ``_mid`` section (built once and shared across fields by
+        batch callers). ``_quote_json`` keeps every value's escaping identical
+        to ``json.dumps(ensure_ascii=False)``. Validation is kept verbatim
+        rather than skipped — the coordinate contract is a security boundary,
+        not overhead to shave.
+        """
+        if _mid is None:
+            _mid = self._validate_aad_mid(table, record_id, schema_id, schema_version, revision)
+        if not isinstance(column, str) or not column.strip():
+            raise ValueError("AAD parameter 'column' must be a non-empty string")
+        return self._ad_prefix + _quote_json(column) + _mid + b"}"
+
     def _track_nonce(self, nonce: bytes) -> None:
         """Deduplicate nonces in a process-lifetime sliding window.
 
         This in-memory window is bounded and is not a cross-session freshness
-        mechanism. Cross-session freshness requires caller-managed revision
+        mechanism. Because AES-SIV is deterministic in
+        ``(key, nonce, AAD, plaintext)``, a nonce that recurs after eviction
+        or restart under the same key and coordinates yields byte-identical
+        ciphertext for identical plaintext — an observer can infer plaintext
+        *equality*, though never the plaintext itself or the key (that is the
+        SIV misuse-resistance guarantee). Cross-session freshness — including
+        suppressing even equality leakage — requires caller-managed revision
         counters bound into the associated data.
+
+        Caller must hold ``self._lock``: dedup + eviction run in the same
+        section as the engine snapshot so a wipe() cannot slip between them.
         """
-        with self._lock:
-            if nonce in self._nonce_set:
-                raise NonceReuseError("Detected duplicate cryptographic nonce")
-            if len(self._nonce_queue) >= self._max_nonces:
-                oldest = self._nonce_queue.popleft()
-                self._nonce_set.discard(oldest)
-            self._nonce_queue.append(nonce)
-            self._nonce_set.add(nonce)
+        if nonce in self._nonce_set:
+            raise NonceReuseError("Detected duplicate cryptographic nonce")
+        if len(self._nonce_queue) >= self._max_nonces:
+            self._nonce_set.discard(self._nonce_queue.popleft())
+        self._nonce_queue.append(nonce)
+        self._nonce_set.add(nonce)
 
     def encrypt(
         self,
-        plaintext: Union[str, bytes],
+        plaintext: Union[str, bytes, bytearray, memoryview],
         *,
         table: str,
         record_id: str,
@@ -279,26 +465,39 @@ class FloorVault:
         reader can select the right key without guessing; this build uses a
         single derived subkey and writes ``0``.
         """
-        if self._closed:
-            raise RuntimeError("FloorVault has been wiped")
         if isinstance(key_id, bool) or not isinstance(key_id, int):
             raise TypeError("key_id must be an integer in [0, 255]")
         if not 0 <= key_id <= 255:
             raise ValueError("key_id must be an integer in [0, 255]")
 
-        data_bytes = plaintext.encode("utf-8") if isinstance(plaintext, str) else bytes(plaintext)
-        aad = associated_data(
+        if isinstance(plaintext, str):
+            data_bytes = plaintext.encode("utf-8")
+        elif isinstance(plaintext, (bytes, bytearray, memoryview)):
+            data_bytes = bytes(plaintext)
+        else:
+            raise TypeError(
+                "plaintext must be str, bytes, bytearray, or memoryview, "
+                f"got {type(plaintext).__name__}"
+            )
+        aad = self._aad(
             table=table,
             record_id=record_id,
             column=column,
             schema_id=schema_id,
             schema_version=schema_version,
-            app_instance_id=self.app_instance_id,
             revision=revision,
         )
 
         nonce = os.urandom(_NONCE_LEN)
-        self._track_nonce(nonce)
+        with self._lock:
+            # One section: the closed-check, the engine snapshot (a concurrent
+            # wipe() that clears the slot cannot tear this call mid-flight —
+            # the local reference keeps the engine alive), and the nonce dedup
+            # stay atomic together. The AEAD call itself stays outside.
+            if self._closed:
+                raise RuntimeError("FloorVault has been wiped")
+            aead = self._aead_siv
+            self._track_nonce(nonce)
 
         # Envelope v2: MAGIC2 (4B) || crypto_version (1B) || key_id (1B)
         #              || nonce_len (1B) || nonce (16B) || ciphertext
@@ -307,12 +506,16 @@ class FloorVault:
         # AES-SIV encrypts with associated data components. The cleartext header
         # is one of them: a rewritten crypto_version or key_id is not merely
         # ignored, it fails authentication.
-        ciphertext = self._aead_siv.encrypt(data_bytes, [aad, header, nonce])
+        ciphertext = aead.encrypt(data_bytes, [aad, header, nonce])
 
         return bytes(header) + nonce + ciphertext
 
     @staticmethod
-    def _ad_components(aad: bytes, header: bytes | None, nonce: bytes) -> list[bytes]:
+    def _ad_components(
+        aad: bytes,
+        header: bytes | memoryview | None,
+        nonce: bytes | memoryview,
+    ) -> list:
         """The AEAD associated-data vector for an envelope of either version.
 
         A v1 envelope carries no header block, so its vector is ``[aad, nonce]``
@@ -342,44 +545,9 @@ class FloorVault:
 
     def _split_envelope(
         self, ciphertext: bytes
-    ) -> tuple[bytes | None, int | None, int | None, bytes, bytes]:
-        """Parse an envelope of either version.
-
-        Returns ``(header, crypto_version, key_id, nonce, raw_ciphertext)``,
-        where ``header``, ``crypto_version`` and ``key_id`` are ``None`` for a
-        v1 envelope, which carries neither.
-        """
-        if not isinstance(ciphertext, (bytes, bytearray)):
-            raise TypeError("Ciphertext must be bytes")
-        if len(ciphertext) < 5 + _NONCE_LEN:
-            raise DecryptionVerificationError("Malformed ciphertext envelope: too short")
-
-        magic = bytes(ciphertext[:4])
-        if magic in (RECORD_MAGIC_V2, b"FLV2"):
-            header = bytes(ciphertext[:_HEADER_LEN_V2])
-            crypto_version = ciphertext[4]
-            key_id = ciphertext[5]
-            if crypto_version != CRYPTO_VERSION:
-                raise DecryptionVerificationError(
-                    f"Unsupported envelope crypto version {crypto_version} "
-                    f"(this build writes {CRYPTO_VERSION})"
-                )
-            offset = _HEADER_LEN_V2
-        elif magic in (RECORD_MAGIC, b"FLRV"):
-            header = crypto_version = key_id = None
-            offset = 5
-        else:
-            raise DecryptionVerificationError("Invalid ciphertext magic header")
-
-        nonce_len = ciphertext[offset - 1]
-        if nonce_len != _NONCE_LEN or len(ciphertext) < offset + nonce_len:
-            raise DecryptionVerificationError("Invalid nonce length in ciphertext envelope")
-
-        nonce = bytes(ciphertext[offset : offset + nonce_len])
-        raw_cipher = bytes(ciphertext[offset + nonce_len :])
-        if not raw_cipher:
-            raise DecryptionVerificationError("Malformed ciphertext envelope: no ciphertext")
-        return header, crypto_version, key_id, nonce, raw_cipher
+    ) -> tuple[memoryview | None, int | None, int | None, memoryview, memoryview]:
+        """Parse an envelope of either version. See :func:`_parse_envelope`."""
+        return _parse_envelope(ciphertext)
 
     def decrypt(
         self,
@@ -409,32 +577,31 @@ class FloorVault:
         Raises:
             DecryptionVerificationError: If tag check fails or coordinates were spliced.
         """
-        if self._closed:
-            raise RuntimeError("FloorVault has been wiped")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("FloorVault has been wiped")
+            aead = self._aead_siv
 
         header, _crypto_version, envelope_key_id, nonce, raw_cipher = self._split_envelope(
             ciphertext
         )
         self._require_key_id(envelope_key_id, key_id)
 
-        aad = associated_data(
+        aad = self._aad(
             table=table,
             record_id=record_id,
             column=column,
             schema_id=schema_id,
             schema_version=schema_version,
-            app_instance_id=self.app_instance_id,
             revision=revision,
         )
 
         try:
-            decrypted_bytes = self._aead_siv.decrypt(
-                raw_cipher, self._ad_components(aad, header, nonce)
-            )
+            decrypted_bytes = aead.decrypt(raw_cipher, self._ad_components(aad, header, nonce))
         except InvalidTag as exc:
             raise DecryptionVerificationError(
-                f"Contextual decryption verification failed for {table}.{column} "
-                f"(record: {record_id}). Data was tampered with, spliced, or corrupted."
+                f"Contextual decryption verification failed for {table}.{column}. "
+                "Data was tampered with, spliced, or corrupted."
             ) from exc
         try:
             return decrypted_bytes.decode("utf-8")
@@ -460,33 +627,140 @@ class FloorVault:
         Use for values that were encrypted from bytes rather than str.
         ``revision`` and ``key_id`` semantics match :meth:`decrypt`.
         """
-        if self._closed:
-            raise RuntimeError("FloorVault has been wiped")
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("FloorVault has been wiped")
+            aead = self._aead_siv
 
         header, _crypto_version, envelope_key_id, nonce, raw_cipher = self._split_envelope(
             ciphertext
         )
         self._require_key_id(envelope_key_id, key_id)
 
-        aad = associated_data(
+        aad = self._aad(
             table=table,
             record_id=record_id,
             column=column,
             schema_id=schema_id,
             schema_version=schema_version,
-            app_instance_id=self.app_instance_id,
             revision=revision,
         )
         try:
-            return self._aead_siv.decrypt(raw_cipher, self._ad_components(aad, header, nonce))
+            return aead.decrypt(raw_cipher, self._ad_components(aad, header, nonce))
         except InvalidTag as exc:
             raise DecryptionVerificationError(
-                f"Contextual decryption verification failed for {table}.{column} "
-                f"(record: {record_id}). Data was tampered with, spliced, or corrupted."
+                f"Contextual decryption verification failed for {table}.{column}. "
+                "Data was tampered with, spliced, or corrupted."
             ) from exc
 
+    def encrypt_fields(
+        self,
+        fields: Mapping[str, Union[str, bytes]],
+        *,
+        table: str,
+        record_id: str,
+        schema_id: str = "hermes.vault.v1",
+        schema_version: int = 1,
+        revision: int | None = None,
+        key_id: int = 0,
+    ) -> dict[str, bytes]:
+        """Encrypt several columns of one record in a single call.
+
+        Every field gets its own nonce and its own fully-bound AAD — the
+        output is identical to calling :meth:`encrypt` per column — but the
+        record-constant AAD section is built once, the coordinates validated
+        once, and the lock taken once. If any field fails, the call raises and
+        no partial result is returned.
+        """
+        if isinstance(key_id, bool) or not isinstance(key_id, int):
+            raise TypeError("key_id must be an integer in [0, 255]")
+        if not 0 <= key_id <= 255:
+            raise ValueError("key_id must be an integer in [0, 255]")
+        mid = self._validate_aad_mid(table, record_id, schema_id, schema_version, revision)
+        ad_prefix = self._ad_prefix
+        items = []
+        for column, value in fields.items():
+            if not isinstance(column, str) or not column.strip():
+                raise ValueError("AAD parameter 'column' must be a non-empty string")
+            if isinstance(value, str):
+                data = value.encode("utf-8")
+            elif isinstance(value, (bytes, bytearray, memoryview)):
+                data = bytes(value)
+            else:
+                raise TypeError(
+                    "plaintext must be str, bytes, bytearray, or memoryview, "
+                    f"got {type(value).__name__}"
+                )
+            items.append(
+                (
+                    column,
+                    data,
+                    ad_prefix + _quote_json(column) + mid + b"}",
+                    os.urandom(_NONCE_LEN),
+                )
+            )
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("FloorVault has been wiped")
+            aead = self._aead_siv
+            for _column, _data, _aad, nonce in items:
+                self._track_nonce(nonce)
+        header = RECORD_MAGIC_V2 + bytes([CRYPTO_VERSION, key_id, _NONCE_LEN])
+        out: dict[str, bytes] = {}
+        for column, data, aad, nonce in items:
+            out[column] = header + nonce + aead.encrypt(data, [aad, header, nonce])
+        return out
+
+    def decrypt_fields(
+        self,
+        fields: Mapping[str, bytes],
+        *,
+        table: str,
+        record_id: str,
+        schema_id: str = "hermes.vault.v1",
+        schema_version: int = 1,
+        revision: int | None = None,
+        key_id: int | None = None,
+    ) -> dict[str, bytes]:
+        """Decrypt several columns of one record in a single call.
+
+        The inverse of :meth:`encrypt_fields`: each envelope is verified
+        against its own column-bound AAD exactly as :meth:`decrypt_bytes`
+        would, but the record-constant AAD section and validation are shared.
+        Returns raw bytes; callers decode per column as needed.
+        """
+        mid = self._validate_aad_mid(table, record_id, schema_id, schema_version, revision)
+        ad_prefix = self._ad_prefix
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("FloorVault has been wiped")
+            aead = self._aead_siv
+        out: dict[str, bytes] = {}
+        for column, envelope in fields.items():
+            if not isinstance(column, str) or not column.strip():
+                raise ValueError("AAD parameter 'column' must be a non-empty string")
+            header, _ver, env_key_id, nonce, raw_cipher = self._split_envelope(envelope)
+            self._require_key_id(env_key_id, key_id)
+            aad = ad_prefix + _quote_json(column) + mid + b"}"
+            try:
+                out[column] = aead.decrypt(raw_cipher, self._ad_components(aad, header, nonce))
+            except InvalidTag as exc:
+                raise DecryptionVerificationError(
+                    f"Contextual decryption verification failed for {table}.{column}. "
+                    "Data was tampered with, spliced, or corrupted."
+                ) from exc
+        return out
+
     def wipe(self) -> None:
-        """Zero all internal functional subkeys and close engine."""
+        """Zero the managed key buffers and close the engine.
+
+        Scope: this covers the ``HardenedMemoryKey`` buffers FloorVault
+        controls. It cannot reach the AEAD engine's internal key copy inside
+        the ``cryptography`` library - that memory is released to the
+        allocator unzeroed on garbage collection - nor any caller-held
+        ``bytes`` intermediates. Treat wipe() as reclaiming FloorVault's own
+        custody, not as proof no key material remains in the process.
+        """
         lock = getattr(self, "_lock", None)
         if lock is not None:
             with lock:
@@ -518,6 +792,7 @@ class FloorVault:
 
 # Backward compatibility alias
 AppStateCrypto = FloorVault
+
 
 # Hermes Vault native aliases
 HermesVault = FloorVault

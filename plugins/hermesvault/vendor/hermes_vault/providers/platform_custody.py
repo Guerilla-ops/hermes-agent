@@ -76,6 +76,18 @@ class ProtectedStoreInvalidLength(ProtectedStoreError):
     """
 
 
+class ProtectedStoreRaceError(ProtectedStoreError):
+    """The store changed identity while it was being opened.
+
+    Distinct from corruption: a legitimately updated store (e.g. the
+    generation-store ``active`` pointer repointed by a concurrent writer)
+    can trip the lstat/open identity check. Callers may retry a bounded
+    number of times and still surface a ``ProtectedStoreError`` if the
+    racing never settles. Subclassing keeps ``except ProtectedStoreError``
+    correct for callers that do not retry.
+    """
+
+
 class ProtectedStoreHeaderError(ProtectedStoreError):
     """The store exists but does not start with the expected magic header.
 
@@ -105,6 +117,7 @@ def read_scheme_store(
     header: bytes,
     expected_length: int | None = 32,
     legacy_path: Path | None = None,
+    allow_legacy_adoption: bool = False,
 ) -> bytes:
     """Read this scheme's store, adopting a pre-split store when that is what it is.
 
@@ -114,6 +127,13 @@ def read_scheme_store(
     ignored, so a raw tier-3 key file no longer blocks the Secret Service tier,
     while a genuine pre-split store is still found. Minting a fresh key beside an
     existing store would leave the user's data undecryptable.
+
+    Adoption is refused unless ``allow_legacy_adoption`` is set: the scheme
+    payloads are deterministic public functions, so an attacker who can write
+    the vault directory can plant a ``master.key`` that parses and have their
+    own key silently adopted - a custody downgrade. The explicit opt-in turns
+    the upgrade into an operator decision; refusing rather than minting keeps
+    the pre-split data reachable.
 
     Raises ``ProtectedStoreMissing`` when neither location holds this scheme's
     store, which is the only condition under which the caller may create one.
@@ -129,12 +149,38 @@ def read_scheme_store(
     except (ProtectedStoreMissing, ProtectedStoreHeaderError):
         # Absent, or another scheme's file: neither is this scheme's store.
         raise ProtectedStoreMissing("protected store not present") from None
+    if not allow_legacy_adoption:
+        raise ProtectedStoreError(
+            f"a pre-split key store exists at {legacy_path}; adopting it is a "
+            "custody decision, not a default - construct the provider with "
+            "allow_legacy_adoption=True to use it, or remove the file"
+        )
     warnings.warn(
         f"adopting the pre-split key store at {legacy_path}; future writes use {path}",
         UserWarning,
         stacklevel=2,
     )
     return adopted
+
+
+def _is_system_symlink(path: Path) -> bool:
+    """True for a root-owned symlink pointing at a root-owned directory.
+
+    macOS ships system firmlinks such as ``/tmp -> /private/tmp`` and
+    ``/var -> /private/var``. A vault base beneath the system temp dir must keep
+    working, but a symlink an attacker planted in a user-writable parent must not
+    be followed. Only root can create a link inside a root-owned directory, so a
+    root-owned link to a root-owned target is a system link, not an attack.
+    """
+    if not hasattr(os, "getuid"):
+        return False
+    try:
+        link_stat = path.lstat()
+        if not stat.S_ISLNK(link_stat.st_mode) or link_stat.st_uid != 0:
+            return False
+        return path.resolve().stat().st_uid == 0
+    except OSError:
+        return False
 
 
 def _mkdir_owner_only(directory: Path) -> None:
@@ -151,6 +197,18 @@ def _mkdir_owner_only(directory: Path) -> None:
             raise ValueError(f"vault directory must not be a symlink: {directory}")
     except FileNotFoundError:
         pass
+
+    # Reject a symlinked *ancestor* before resolving: ``resolve()`` below follows
+    # every ancestor link, so without this an attacker-controlled parent symlink
+    # would silently redirect the vault to a location of their choosing. Only
+    # root-owned system firmlinks (macOS /tmp, /var) are exempt.
+    for ancestor in directory.parents:
+        try:
+            ancestor_stat = ancestor.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(ancestor_stat.st_mode) and not _is_system_symlink(ancestor):
+            raise ValueError(f"vault ancestor must not be a symlink: {ancestor}")
 
     directory = directory.parent.resolve() / directory.name
 
@@ -171,12 +229,14 @@ def _mkdir_owner_only(directory: Path) -> None:
 
     for item in reversed(missing):
         item.mkdir(mode=0o700, exist_ok=False)
+        _fsync_directory(item.parent)
 
     final_stat = directory.lstat()
     if stat.S_ISLNK(final_stat.st_mode) or not stat.S_ISDIR(final_stat.st_mode):
         raise ValueError(f"vault path is not an owner-controlled directory: {directory}")
     if hasattr(os, "getuid") and final_stat.st_uid != os.getuid():
         raise ValueError(f"vault directory is not owned by the current user: {directory}")
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions
     os.chmod(directory, 0o700)
 
 
@@ -194,7 +254,9 @@ def write_protected(
     :func:`_link_no_clobber`, which uses ``os.link`` - the OS fails that call if
     the destination exists, so there is no check-then-use window. Two processes
     starting at once therefore cannot both conclude "no store yet" and silently
-    rotate each other's key; exactly one wins and the loser fails loudly.
+    rotate each other's key; exactly one wins and the loser fails loudly. A
+    filesystem that cannot provide that atomicity fails closed rather than
+    falling back to a racy check-then-replace.
     """
     if expected_length is not None and len(key) != expected_length:
         raise ProtectedStoreInvalidLength(f"master key must be exactly {expected_length} bytes")
@@ -219,6 +281,7 @@ def write_protected(
         os.close(descriptor)
         descriptor = None
         _link_no_clobber(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -226,6 +289,32 @@ def write_protected(
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+        else:
+            _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush ``directory`` metadata so a name inside it survives power loss.
+
+    ``os.fsync`` on the file alone does not durable-publish its directory
+    entry: a power cut between the link and the kernel's next metadata flush
+    can still lose the store. NTFS journals directory metadata itself and
+    Python cannot open a directory for fsync on Windows, so this is a no-op
+    there. The check is ``os.name`` rather than ``is_windows()`` on purpose:
+    tests simulate POSIX custody checks on Windows by monkeypatching the
+    latter, but the real kernel decides whether a directory fsync is even
+    possible.
+    """
+    if os.name != "posix":
+        return
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _write_all(descriptor: int, data: bytes) -> None:
@@ -245,6 +334,13 @@ def _link_no_clobber(temporary: Path, path: Path) -> None:
     fails with ``FileExistsError``, with no window between checking and acting.
     (``renameat2(RENAME_NOREPLACE)`` would be the Linux-native equivalent but is
     not exposed by Python's ``os`` module, and ``os.replace`` always clobbers.)
+
+    There is deliberately no check-then-replace fallback. On a filesystem where
+    hard links are unavailable (some network or FAT volumes) a check followed
+    by ``os.replace`` is racy: two concurrent creators could each pass the
+    existence check and replace each other's store - silently rotating the
+    master key. A loud failure is the safe outcome, so other link failures are
+    refused rather than degraded.
     """
     try:
         os.link(temporary, path)
@@ -252,15 +348,13 @@ def _link_no_clobber(temporary: Path, path: Path) -> None:
         raise ProtectedStoreError(
             f"refusing to overwrite an existing protected store: {path}"
         ) from exc
-    except OSError:
-        # Hard links are unavailable on some filesystems (e.g. certain network or
-        # FAT volumes). Fall back to check-then-replace, which is NOT atomic: two
-        # concurrent writers could both win. Documented limitation, not a claim.
-        if path.exists():
-            raise ProtectedStoreError(
-                f"refusing to overwrite an existing protected store: {path}"
-            ) from None
-        os.replace(temporary, path)
+    except OSError as exc:
+        raise ProtectedStoreError(
+            f"atomic no-clobber publication is unavailable on the filesystem "
+            f"holding {path} ({exc}); the store must live on a filesystem that "
+            "supports hard links - refusing a non-atomic replace that could "
+            "silently overwrite a concurrent writer's key"
+        ) from exc
 
 
 def read_protected(path: Path, *, header: bytes, expected_length: int | None = 32) -> bytes:
@@ -280,6 +374,12 @@ def read_protected(path: Path, *, header: bytes, expected_length: int | None = 3
         | binary_mode_flag()
         | getattr(os, "O_CLOEXEC", 0)
         | getattr(os, "O_NOFOLLOW", 0)
+        # O_NONBLOCK makes a FIFO (or other non-regular path an OS would block
+        # opening, like a device node) return immediately; the fstat/lstat
+        # identity checks below then reject it as "not a regular file". A
+        # blocking open is a planted-FIFO liveness denial of service against
+        # resolve_key(). The flag is inert on regular files.
+        | getattr(os, "O_NONBLOCK", 0)
     )
     try:
         fd = os.open(path, flags)
@@ -314,7 +414,7 @@ def read_protected(path: Path, *, header: bytes, expected_length: int | None = 3
         if not stat.S_ISREG(path_stat.st_mode):
             raise ProtectedStoreError("protected store is not a regular file")
         if (path_stat.st_dev, path_stat.st_ino) != (file_stat.st_dev, file_stat.st_ino):
-            raise ProtectedStoreError(
+            raise ProtectedStoreRaceError(
                 "protected store changed identity between the path check and the open"
             )
         # No separate regular-file check on the descriptor: the path is a regular

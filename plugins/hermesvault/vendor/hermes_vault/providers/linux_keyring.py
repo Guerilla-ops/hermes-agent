@@ -36,7 +36,7 @@ from .platform_custody import (
     write_protected,
 )
 
-_HEADER = b"FLOORLV1"  # floorvault protected key store, linux/secret-service boundary
+_HEADER = b"FLOORLV1"  # hermes_vault protected key store, linux/secret-service boundary
 
 #: ``secretstorage`` module-level callables this client calls by name.
 #:
@@ -52,13 +52,13 @@ _REQUIRED_SECRETSTORAGE_API = ("dbus_init", "get_default_collection")
 #: The exception raised by ``secretstorage`` when no session bus / service is
 #: reachable. Named as a string so the contract test compares names rather than
 #: importing a package that is absent on non-Linux hosts.
-_SECRET_SERVICE_UNAVAILABLE_EXCEPTION = "SecretServiceNotAvailableException"
+_SECRET_SERVICE_UNAVAILABLE_EXCEPTION = "SecretServiceNotAvailableException"  # nosec B105
 
 #: ``secretstorage`` attribute key naming the application boundary.
 _ATTRIBUTE_APPLICATION = "application"
 
-#: Attribute key binding an entry to a floorvault account within the service.
-_ATTRIBUTE_KEY = "floorvault"
+#: Attribute key binding an entry to a hermes_vault account within the service.
+_ATTRIBUTE_KEY = "hermes_vault"
 
 
 def _random(n: int) -> bytes:
@@ -109,16 +109,24 @@ class LinuxSecretServiceKeyProvider(KeyProvider):
         self,
         *,
         store_path: str | Path,
-        service: str = "floorvault",
+        service: str = "hermes_vault",
         attribute: str = "master-key",
         random_bytes: Callable[[int], bytes] = _random,
+        allow_file_fallback: bool = True,
+        allow_legacy_adoption: bool = False,
     ) -> None:
         if not service or not isinstance(service, str):
             raise ValueError("service must be a non-empty string")
         self._path = Path(store_path)
+        self._allow_legacy_adoption = allow_legacy_adoption
         self._service = service
         self._attribute = attribute
         self._random_bytes = random_bytes
+        # The masked-file tier is disk custody, so it obeys the caller's disk
+        # policy too: AdaptiveKeyProvider passes allow_disk_fallback here, and
+        # strict mode must not have an existing master.key.ss silently read for
+        # it. Standalone callers keep the documented fallback by default.
+        self._allow_file_fallback = allow_file_fallback
 
     # ---- Secret Service primary (Linux, interactive) ----------------------
 
@@ -232,7 +240,7 @@ class LinuxSecretServiceKeyProvider(KeyProvider):
             if callable(close):
                 try:
                     close()
-                except Exception:  # noqa: BLE001 - cleanup must not mask the result
+                except Exception:  # noqa: BLE001 - cleanup must not mask the result  # nosec B110
                     pass
 
     # ---- fallback custody (masked protected file) -------------------------
@@ -254,12 +262,21 @@ class LinuxSecretServiceKeyProvider(KeyProvider):
             via_ss = self._resolve_via_secret_service(allow_create=allow_create)
             if via_ss is not None:
                 return via_ss
-        # Fallback: masked protected file.
+        # Fallback: masked protected file. The mask is a deterministic public
+        # pad, so this tier is disk custody - a caller whose policy forbids disk
+        # custody must not have an existing store silently read for it either.
+        if not self._allow_file_fallback:
+            raise MissingKeyError(
+                "Secret Service did not resolve a key and file-based key custody "
+                "is not permitted by policy; refusing to read or create the "
+                "masked key store"
+            )
         try:
             blob = read_scheme_store(
                 self._path,
                 header=_HEADER,
                 legacy_path=self._legacy_store_path(),
+                allow_legacy_adoption=self._allow_legacy_adoption,
             )
         except ProtectedStoreMissing:
             # Absent: creating below is correct. Other read failures propagate,
