@@ -1,0 +1,170 @@
+"""Opt-in FloorVault store for the local credential vault (``vault.store: floorvault``).
+
+Drop-in replacement for :class:`agent.vault_store.VaultStore` backed by the
+``floorvault`` package (the ``floorvault`` extra; PM installs it on first use):
+
+- The master key lives in OS-backed custody (macOS Keychain, Windows DPAPI,
+  Linux Secret Service), not in a ``vault.key`` file next to the ciphertext.
+  Headless hosts supply a 64-hex key via ``FLOOR_VAULT_KEY`` (or
+  ``VAULT_MASTER_KEY``); with neither, construction fails closed.
+- Each field is sealed with AES-256-SIV whose associated data binds it to its
+  app instance, table, record id and column, so a ciphertext copied onto
+  another row fails verification instead of decrypting.
+- Items live in an indexed SQLite file (``vault.db``); a lookup decrypts one
+  row rather than the whole vault.
+
+Handles keep the ``vault_`` prefix, so ``LocalLoginBackend`` and every caller
+of ``get_vault_store()`` route here unchanged. Errors are re-raised as
+:class:`agent.vault_store.VaultError` so existing ``except VaultError`` paths
+keep working.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Iterator, Optional
+
+from agent.vault_store import VaultError, VaultItemMeta, VaultStore
+
+APP_INSTANCE_ID = "hermes-agent"
+KEYRING_SERVICE = "hermes-agent-vault"
+
+_STORES: dict[Path, FloorVaultStore] = {}
+_STORES_LOCK = threading.Lock()
+
+
+@contextmanager
+def _as_vault_error() -> Iterator[None]:
+    """Map floorvault failures onto Hermes's VaultError. Messages from floorvault never carry
+    secret values (its own contract), but the decrypt failure is reworded to name the cause."""
+    from floorvault import DecryptionVerificationError, FloorVaultError, KeyProviderError
+    from floorvault.vaultkit.vault import VaultError as FloorVaultStoreError
+
+    try:
+        yield
+    except DecryptionVerificationError as exc:
+        raise VaultError("vault item failed authentication (tampered, moved, or wrong key)") from exc
+    except KeyProviderError as exc:
+        raise VaultError(
+            "FloorVault master key unavailable: no OS key store (Keychain, DPAPI, Secret Service) is "
+            "usable and FLOOR_VAULT_KEY is not set. On a headless host, export FLOOR_VAULT_KEY as 64 "
+            "hex characters, the same value every run, or the vault cannot be decrypted.") from exc
+    except (FloorVaultStoreError, FloorVaultError) as exc:
+        raise VaultError(str(exc)) from exc
+    except sqlite3.IntegrityError as exc:
+        raise VaultError("a vault item with that id already exists") from exc
+    except sqlite3.Error as exc:
+        raise VaultError(f"vault database error: {exc}") from exc
+
+
+def _require_floorvault() -> None:
+    """PM installs the ``floorvault`` extra on first use (it is opt-in, not in ``[all]``)."""
+    from pm import ensure_import, install_hint
+    from pm.package import InstallError
+
+    try:
+        ensure_import("floorvault")
+        import floorvault
+    except (InstallError, ImportError) as exc:
+        raise VaultError(f"the FloorVault vault store needs the floorvault package: {exc}. "
+                         f"Run: {install_hint('floorvault')}") from exc
+
+
+def _convert(meta: Any) -> VaultItemMeta:
+    return VaultItemMeta(
+        id=meta.id, kind=meta.kind, label=meta.label, origin=meta.origin, created_at=meta.created_at,
+        identifier_type=meta.identifier_type, identifier=meta.identifier, has_otp=bool(meta.has_otp))
+
+
+class FloorVaultStore:
+    """Same public surface as ``VaultStore``: add_item, list_items, has_items, remove_item,
+    get_meta, resolve_secret."""
+
+    def __init__(self, base_dir: Path, *, crypto: Any = None):
+        _require_floorvault()
+        from floorvault import AdaptiveKeyProvider, FloorVault
+        from floorvault.vaultkit.vault import VaultStore as _Store
+
+        self._base = Path(base_dir)
+        with _as_vault_error():
+            if crypto is None:
+                key = AdaptiveKeyProvider(service_name=KEYRING_SERVICE, fallback_dir=self._base).resolve_key()
+                crypto = FloorVault(key, app_instance_id=APP_INSTANCE_ID)
+            self._store = _Store(self._base, crypto=crypto)
+
+    def add_item(self, kind: str, label: str, secret: dict[str, Any], origin: Optional[str] = None,
+                 *, item_id: Optional[str] = None) -> VaultItemMeta:
+        with _as_vault_error():
+            return _convert(self._store.add_item(kind, label, dict(secret), origin, item_id=item_id))
+
+    def list_items(self) -> list[VaultItemMeta]:
+        with _as_vault_error():
+            return [_convert(m) for m in self._store.list_items()]
+
+    def has_items(self) -> bool:
+        with _as_vault_error():
+            return self._store.has_items()
+
+    def remove_item(self, item_id: str) -> bool:
+        with _as_vault_error():
+            return self._store.remove_item(item_id)
+
+    def get_meta(self, item_id: str) -> Optional[VaultItemMeta]:
+        with _as_vault_error():
+            meta = self._store.get_meta(item_id)
+        return _convert(meta) if meta is not None else None
+
+    def resolve_secret(self, item_id: str) -> dict[str, Any]:
+        """Server-side only, same contract as ``VaultStore.resolve_secret``."""
+        with _as_vault_error():
+            return dict(self._store.resolve_secret(item_id))
+
+
+def get_floorvault_store(base_dir: Path) -> FloorVaultStore:
+    """One store per vault dir per process, so the OS key store is asked once, not on every fill."""
+    base_dir = Path(base_dir)
+    with _STORES_LOCK:
+        store = _STORES.get(base_dir)
+        if store is None:
+            store = _STORES[base_dir] = FloorVaultStore(base_dir)
+        return store
+
+
+def _legacy_login_secret(rec: dict[str, Any]) -> dict[str, Any]:
+    secret = dict(rec.get("secret") or {})
+    if rec.get("kind") == "login":
+        secret["identifier_type"] = rec.get("identifier_type")
+        secret["identifier"] = rec.get("identifier")
+    return secret
+
+
+def migrate_from_fernet(legacy: VaultStore, target: FloorVaultStore) -> dict[str, Any]:
+    """Copy every item of a Fernet vault into *target*, keeping each item's id so existing
+    ``vault_…`` handles keep resolving. Idempotent: ids already in *target* are skipped. Every
+    copied item is read back and compared before reporting success. The legacy files are never
+    modified; removing them is the caller's decision once ``verified`` is True."""
+    with legacy._locked():
+        records = legacy._read_all()
+    present = {m.id for m in target.list_items()}
+    copied = skipped = 0
+    for rec in records:
+        if rec.get("id") in present:
+            skipped += 1
+            continue
+        target.add_item(str(rec.get("kind")), str(rec.get("label") or ""), _legacy_login_secret(rec),
+                        rec.get("origin"), item_id=str(rec.get("id")))
+        copied += 1
+    verified = all(_matches(target, rec) for rec in records)
+    return {"total": len(records), "copied": copied, "skipped": skipped, "verified": verified}
+
+
+def _matches(target: FloorVaultStore, rec: dict[str, Any]) -> bool:
+    meta = target.get_meta(str(rec.get("id")))
+    if meta is None or meta.kind != rec.get("kind") or meta.origin != rec.get("origin"):
+        return False
+    if meta.identifier != (rec.get("identifier") or None):
+        return False
+    return target.resolve_secret(meta.id) == {k: str(v) for k, v in (rec.get("secret") or {}).items()}

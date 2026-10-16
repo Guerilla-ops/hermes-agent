@@ -424,8 +424,27 @@ class VaultStore:
         )
 
 
+VAULT_STORES = ("fernet", "floorvault")
+
+
+def configured_store_name() -> str:
+    """``vault.store`` from config.yaml: ``fernet`` (default) or ``floorvault``."""
+    from hermes_cli.config import load_config_readonly
+
+    section = load_config_readonly().get("vault") or {}
+    name = str(section.get("store") or "fernet").strip().lower() if isinstance(section, dict) else "fernet"
+    if name not in VAULT_STORES:
+        raise VaultError(f"unknown vault.store {name!r} (expected one of {VAULT_STORES})")
+    return name
+
+
 def get_vault_store() -> VaultStore:
-    """Default profile-scoped vault store."""
+    """Default profile-scoped vault store. ``vault.store: floorvault`` selects the
+    OS-key-custody store in ``agent/vault_store_floorvault.py`` (same public API)."""
+    if configured_store_name() == "floorvault":
+        from agent.vault_store_floorvault import get_floorvault_store
+
+        return get_floorvault_store(Path(get_hermes_home()) / "vault")  # type: ignore[return-value]
     return VaultStore()
 
 
