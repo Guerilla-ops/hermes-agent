@@ -132,9 +132,13 @@ def _cmd_show(args) -> int:
         for name, value in items.items():
             print(f"{name}={value}")
     else:
-        names = [field] if field else sorted(secret)
-        for name in names:
-            print(f"{name}\t{'(set)' if secret.get(name) else '(empty)'}")
+        if field:
+            print("(set)" if secret.get(field) else "(empty)")
+        else:
+            total = len(secret)
+            set_count = sum(1 for v in secret.values() if v)
+            empty_count = total - set_count
+            print(f"{total} field(s): {set_count} set, {empty_count} empty")
         print("use --reveal to print values", file=sys.stderr)
     return 0
 
