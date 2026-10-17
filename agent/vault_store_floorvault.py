@@ -13,6 +13,12 @@ Drop-in replacement for :class:`agent.vault_store.VaultStore` backed by the
 - Items live in an indexed SQLite file (``vault.db``); a lookup decrypts one
   row rather than the whole vault.
 
+Constructing the store asks floorvault for hardened key memory; a deliberate
+side effect of that hardening is ``RLIMIT_CORE=0`` — no core dumps for the rest
+of the process lifetime, so a crash cannot write the master key to disk. The
+cost lands outside the vault: Hermes crash diagnostics lose cores once the
+store is first opened.
+
 Handles keep the ``vault_`` prefix, so ``LocalLoginBackend`` and every caller
 of ``get_vault_store()`` route here unchanged. Errors are re-raised as
 :class:`agent.vault_store.VaultError` so existing ``except VaultError`` paths
@@ -62,6 +68,14 @@ def _as_vault_error() -> Iterator[None]:
         raise VaultError(f"vault database error: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise VaultError("vault item payload is corrupted (invalid JSON)") from exc
+    except VaultError:
+        raise
+    # floorvault internals surface stdlib failures (a malformed OS-custody blob
+    # raises ValueError/TypeError in the key container, fs failures raise
+    # OSError); callers only handle VaultError, so every foreign failure must be
+    # remapped, not passed through.
+    except Exception as exc:
+        raise VaultError(f"vault operation failed ({type(exc).__name__}): {exc}") from exc
 
 
 def _require_floorvault() -> None:
@@ -89,11 +103,11 @@ class FloorVaultStore:
 
     def __init__(self, base_dir: Path, *, crypto: Any = None):
         _require_floorvault()
-        from floorvault import AdaptiveKeyProvider, FloorVault
-        from floorvault.vaultkit.vault import VaultStore as _Store
-
         self._base = Path(base_dir)
         with _as_vault_error():
+            from floorvault import AdaptiveKeyProvider, FloorVault
+            from floorvault.vaultkit.vault import VaultStore as _Store
+
             if crypto is None:
                 key = AdaptiveKeyProvider(service_name=KEYRING_SERVICE, fallback_dir=self._base).resolve_key()
                 crypto = FloorVault(key, app_instance_id=APP_INSTANCE_ID)
@@ -183,7 +197,7 @@ def migrate_from_fernet(legacy: VaultStore, target: FloorVaultStore, *,
             retired = target._store.list_legacy_retirements()
         present = {m.id for m in target.list_items()}
         copied = skipped = 0
-        verified = True
+        mismatched: list[str] = []
         for rec in records:
             item_id = str(rec.get("id"))
             if item_id in retired and item_id not in present:
@@ -199,10 +213,19 @@ def migrate_from_fernet(legacy: VaultStore, target: FloorVaultStore, *,
                 with _as_vault_error():
                     target._store.retire_legacy_id(item_id, item_id)
             else:
-                verified = False
+                mismatched.append(item_id)
+        verified = not mismatched
         if verified and on_verified is not None:
-            on_verified()
-    return {"total": len(records), "copied": copied, "skipped": skipped, "verified": verified}
+            try:
+                on_verified()
+            except VaultError:
+                raise
+            # Callback failures (config write, legacy removal) must reach the CLI
+            # as VaultError, never a raw traceback.
+            except Exception as exc:
+                raise VaultError(f"post-verification step failed: {exc}") from exc
+    return {"total": len(records), "copied": copied, "skipped": skipped,
+            "verified": verified, "mismatched": mismatched}
 
 
 def _matches(target: FloorVaultStore, rec: dict[str, Any]) -> bool:

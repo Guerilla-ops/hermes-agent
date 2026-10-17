@@ -105,7 +105,9 @@ def _cmd_add(args) -> None:
                     secret[field] = value
             meta = get_vault_store().add_item(kind=kind, label=label, secret=secret, origin=origin)
     except VaultError as exc:
-        c.print(f"[red]Error:[/] {exc}")
+        from rich.markup import escape
+
+        c.print(f"[red]Error:[/] {escape(str(exc))}")
         return
 
     c.print(f"[green]Stored.[/] handle=[bold]{meta.id}[/] kind={meta.kind} origin={meta.origin or '-'}")
@@ -212,6 +214,10 @@ def _cmd_migrate_floorvault(args) -> None:
             f"({result['skipped']} already present) into {base / 'vault.db'}.")
     if not result["verified"]:
         c.print("[red]Verification failed:[/] the FloorVault copy does not match; the Fernet vault is untouched.")
+        if result["mismatched"]:
+            c.print(f"[dim]Mismatched handles: {', '.join(result['mismatched'])} — fix or remove the conflicting "
+                    "FloorVault item (`hermes config set vault.store floorvault`, then `hermes vault rm`), "
+                    "then rerun the migration.[/]")
         return
     c.print("[green]Verified[/]: newly migrated items read back identical; previously migrated ids stay retired "
             "[dim](created_at shows the migration time — the original timestamps do not carry over).[/]")
@@ -270,4 +276,6 @@ def vault_command(args) -> None:
             return
         handler(args)
     except VaultError as exc:
-        _console().print(f"[red]Error:[/] {exc}")
+        from rich.markup import escape
+
+        _console().print(f"[red]Error:[/] {escape(str(exc))}")

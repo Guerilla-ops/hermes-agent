@@ -26,7 +26,7 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import urlsplit
 
 from hermes_constants import get_hermes_home
@@ -448,13 +448,27 @@ def configured_store_name(config_path: Optional[Path] = None) -> str:
     return name
 
 
-def get_vault_store() -> VaultStore:
+class VaultStoreLike(Protocol):
+    """Structural contract shared by ``VaultStore`` and the FloorVault store
+    (``agent/vault_store_floorvault.FloorVaultStore``). Both answer the same six
+    methods; callers of ``get_vault_store()`` depend on this surface only."""
+
+    def add_item(self, kind: str, label: str, secret: dict[str, Any],
+                 origin: Optional[str] = None) -> VaultItemMeta: ...
+    def list_items(self) -> list[VaultItemMeta]: ...
+    def has_items(self) -> bool: ...
+    def remove_item(self, item_id: str) -> bool: ...
+    def get_meta(self, item_id: str) -> Optional[VaultItemMeta]: ...
+    def resolve_secret(self, item_id: str) -> dict[str, Any]: ...
+
+
+def get_vault_store() -> VaultStoreLike:
     """Default profile-scoped vault store. ``vault.store: floorvault`` selects the
     OS-key-custody store in ``agent/vault_store_floorvault.py`` (same public API)."""
     if configured_store_name() == "floorvault":
         from agent.vault_store_floorvault import get_floorvault_store
 
-        return get_floorvault_store(Path(get_hermes_home()) / "vault")  # type: ignore[return-value]
+        return get_floorvault_store(Path(get_hermes_home()) / "vault")
     return VaultStore()
 
 

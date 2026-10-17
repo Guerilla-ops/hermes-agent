@@ -159,13 +159,14 @@ def test_migration_keeps_handles_and_verifies(tmp_path):
     target = _store(tmp_path / "vault")
 
     result = migrate_from_fernet(legacy, target)
-    assert result == {"total": 2, "copied": 2, "skipped": 0, "verified": True}
+    assert result == {"total": 2, "copied": 2, "skipped": 0, "verified": True, "mismatched": []}
     assert target.resolve_secret(login.id) == legacy.resolve_secret(login.id)
     assert target.resolve_secret(card.id) == CARD
     assert target.get_meta(login.id).identifier == "u@example.com"
     # Legacy files are untouched; a rerun is a no-op.
     assert legacy.resolve_secret(login.id)["password"] == "hunter2-pw"
-    assert migrate_from_fernet(legacy, target) == {"total": 2, "copied": 0, "skipped": 2, "verified": True}
+    assert migrate_from_fernet(legacy, target) == {"total": 2, "copied": 0, "skipped": 2, "verified": True,
+                                                  "mismatched": []}
 
 
 def test_migration_reports_mismatch(tmp_path):
@@ -174,7 +175,8 @@ def test_migration_reports_mismatch(tmp_path):
     target = _store(tmp_path / "vault")
     target.add_item("login", "Example", {**LOGIN, "password": "different"}, origin="https://example.com",
                     item_id=login.id)
-    assert migrate_from_fernet(legacy, target)["verified"] is False
+    result = migrate_from_fernet(legacy, target)
+    assert result["verified"] is False and result["mismatched"] == [login.id]
 
 
 def test_migration_detects_label_mismatch(tmp_path):
@@ -183,7 +185,7 @@ def test_migration_detects_label_mismatch(tmp_path):
     target = _store(tmp_path / "vault")
     target.add_item("login", "Different label", dict(LOGIN), origin="https://example.com",
                     item_id=login.id)
-    assert migrate_from_fernet(legacy, target)["verified"] is False
+    assert migrate_from_fernet(legacy, target)["mismatched"] == [login.id]
 
 
 @pytest.mark.parametrize('parameters,canonical', [
@@ -211,7 +213,7 @@ def test_migration_rerun_does_not_resurrect_deleted_items(tmp_path):
     # Reopen, as a later CLI invocation would: retirement must survive process exit.
     reopened = _store(tmp_path / 'vault', key)
     assert migrate_from_fernet(legacy, reopened) == {
-        'total': 1, 'copied': 0, 'skipped': 1, 'verified': True,
+        'total': 1, 'copied': 0, 'skipped': 1, 'verified': True, 'mismatched': [],
     }
     assert reopened.get_meta(item.id) is None
 
@@ -327,3 +329,87 @@ sys.exit(1)
 
     assert migrate_from_fernet(legacy, target, on_verified=check_lock)['verified']
     assert blocked == [True]
+
+
+@pytest.mark.parametrize("exc", [
+    ValueError("master_key must be exactly 32 bytes (got 64)"),
+    OSError("permission denied"),
+    RuntimeError("Attempted to access wiped HardenedMemoryKey"),
+])
+def test_foreign_store_failures_map_to_vault_error(tmp_path, exc):
+    # floorvault internals surface stdlib errors — a malformed OS-custody blob
+    # raises ValueError inside the key container, fs failures raise OSError — and
+    # callers only handle VaultError, so none of these may pass through raw.
+    with patch("floorvault.providers.adaptive.AdaptiveKeyProvider.resolve_key", side_effect=exc):
+        with pytest.raises(VaultError):
+            FloorVaultStore(tmp_path / "vault")
+
+
+def test_cli_legacy_removal_failure_surfaces_as_vault_error(tmp_path, monkeypatch):
+    # `--remove-legacy` unlink failures must not produce a raw traceback; the
+    # verified config flip still stands (legacy files remaining is the safe side).
+    from pathlib import Path
+    from types import SimpleNamespace
+    from agent.vault_store import configured_store_name
+    from hermes_cli import vault
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("APPSTATE_KEY", raising=False)
+    monkeypatch.setenv("FLOOR_VAULT_KEY", secrets.token_hex(32))
+    legacy = VaultStore()
+    legacy.add_item("login", "Original", dict(LOGIN), origin="https://example.com")
+
+    real_unlink = Path.unlink
+
+    def selective_unlink(self, missing_ok=False):
+        if self.name in {"vault.json.enc", "vault.key"}:
+            raise OSError("read-only filesystem")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", selective_unlink)
+    with pytest.raises(VaultError, match="post-verification step failed"):
+        vault._cmd_migrate_floorvault(SimpleNamespace(remove_legacy=True))
+    assert configured_store_name(tmp_path / "config.yaml") == "floorvault"
+    assert (tmp_path / "vault" / "vault.db").exists()
+
+
+def test_cli_verification_failure_names_the_mismatched_handle(tmp_path, monkeypatch):
+    import io
+    from types import SimpleNamespace
+    from rich.console import Console
+    from agent.vault_store import configured_store_name
+    from agent.vault_store_floorvault import get_floorvault_store
+    from hermes_cli import vault
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("APPSTATE_KEY", raising=False)
+    monkeypatch.setenv("FLOOR_VAULT_KEY", secrets.token_hex(32))
+    legacy = VaultStore()
+    item = legacy.add_item("login", "Original", dict(LOGIN), origin="https://example.com")
+    get_floorvault_store(tmp_path / "vault").add_item(
+        "login", "Original", {**LOGIN, "password": "different"}, origin="https://example.com",
+        item_id=item.id)
+    recorder = Console(record=True, file=io.StringIO(), force_terminal=False)
+    monkeypatch.setattr(vault, "_console", lambda: recorder)
+    vault._cmd_migrate_floorvault(SimpleNamespace(remove_legacy=True))
+    out = recorder.export_text()
+    assert "Verification failed" in out and item.id in out
+    assert configured_store_name(tmp_path / "config.yaml") == "fernet"
+
+
+def test_cli_error_output_preserves_bracketed_names(monkeypatch):
+    # FloorVault messages carry "[macos]"/"[linux]" extra names; printed raw, Rich
+    # markup swallows them — escape so the user keeps the actionable part.
+    import io
+    from types import SimpleNamespace
+    from rich.console import Console
+    from hermes_cli import vault
+
+    recorder = Console(record=True, file=io.StringIO(), force_terminal=False)
+    monkeypatch.setattr(vault, "_console", lambda: recorder)
+
+    def boom(_args):
+        raise VaultError("install floorvault[macos] to enable the macOS Keychain tier")
+
+    vault.vault_command(SimpleNamespace(_vault_handler=boom))
+    assert "[macos]" in recorder.export_text()
