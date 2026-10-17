@@ -184,3 +184,146 @@ def test_migration_detects_label_mismatch(tmp_path):
     target.add_item("login", "Different label", dict(LOGIN), origin="https://example.com",
                     item_id=login.id)
     assert migrate_from_fernet(legacy, target)["verified"] is False
+
+
+@pytest.mark.parametrize('parameters,canonical', [
+    ('digits=8', 'JBSWY3DPEHPK3PXP|8|30|SHA1'),
+    ('period=60&algorithm=SHA256', 'JBSWY3DPEHPK3PXP|6|60|SHA256'),
+    ('digits=8&period=60&algorithm=SHA512', 'JBSWY3DPEHPK3PXP|8|60|SHA512'),
+])
+def test_migration_preserves_custom_totp_parameters(tmp_path, parameters, canonical):
+    legacy = VaultStore(tmp_path / 'vault')
+    item = legacy.add_item('login', 'Custom OTP', {
+        **LOGIN, 'otp_secret': f'otpauth://totp/Test?secret=JBSWY3DPEHPK3PXP&{parameters}',
+    }, origin='https://example.com')
+    target = _store(tmp_path / 'vault')
+    assert migrate_from_fernet(legacy, target)['verified']
+    assert target.resolve_secret(item.id)['otp_secret'] == canonical
+
+
+def test_migration_rerun_does_not_resurrect_deleted_items(tmp_path):
+    legacy = VaultStore(tmp_path / 'vault')
+    item = legacy.add_item('login', 'Example', dict(LOGIN), origin='https://example.com')
+    key = secrets.token_bytes(32)
+    target = _store(tmp_path / 'vault', key)
+    assert migrate_from_fernet(legacy, target)['verified']
+    assert target.remove_item(item.id)
+    # Reopen, as a later CLI invocation would: retirement must survive process exit.
+    reopened = _store(tmp_path / 'vault', key)
+    assert migrate_from_fernet(legacy, reopened) == {
+        'total': 1, 'copied': 0, 'skipped': 1, 'verified': True,
+    }
+    assert reopened.get_meta(item.id) is None
+
+
+def test_cli_cutover_rejects_waiting_fernet_writer(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from agent.vault_store_floorvault import get_floorvault_store
+    from hermes_cli import config, vault
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.delenv('APPSTATE_KEY', raising=False)
+    monkeypatch.setenv('FLOOR_VAULT_KEY', secrets.token_hex(32))
+    legacy = VaultStore()
+    item = legacy.add_item('login', 'Original', dict(LOGIN), origin='https://example.com')
+    stale = VaultStore()
+    outcomes = []
+    started = threading.Event()
+
+    def writer():
+        started.set()
+        try:
+            outcomes.append(stale.add_item('login', 'Late', dict(LOGIN), origin='https://example.com'))
+        except VaultError as exc:
+            outcomes.append(exc)
+
+    thread = threading.Thread(target=writer)
+    save_config = config.save_config
+
+    def save_and_start(cfg):
+        save_config(cfg)
+        thread.start()
+        assert started.wait(5)
+
+    monkeypatch.setattr(config, 'save_config', save_and_start)
+    try:
+        vault._cmd_migrate_floorvault(SimpleNamespace(remove_legacy=True))
+    finally:
+        if thread.ident is not None:
+            thread.join(5)
+    assert not thread.is_alive()
+    assert len(outcomes) == 1 and isinstance(outcomes[0], VaultError)
+    assert get_floorvault_store(tmp_path / 'vault').get_meta(item.id) is not None
+    assert not legacy._vault_path.exists()
+    assert not legacy._key_path.exists()
+
+
+def test_fernet_write_guard_uses_own_home_and_allows_explicit_revert(tmp_path):
+    from hermes_cli.config import atomic_config_write
+
+    owner = tmp_path / 'other-profile'
+    legacy = VaultStore(owner / 'vault')
+    item = legacy.add_item('login', 'Example', dict(LOGIN), origin='https://example.com')
+    atomic_config_write(owner / 'config.yaml', {'vault': {'store': 'floorvault'}})
+    with pytest.raises(VaultError):
+        legacy.add_item('login', 'Stale', dict(LOGIN), origin='https://example.com')
+    with pytest.raises(VaultError):
+        legacy.remove_item(item.id)
+    atomic_config_write(owner / 'config.yaml', {'vault': {'store': 'fernet'}})
+    assert legacy.remove_item(item.id)
+
+
+def test_fernet_write_guard_ignores_frozen_worker_config(tmp_path, monkeypatch):
+    from hermes_cli.config import atomic_config_write
+
+    legacy = VaultStore(tmp_path / 'vault')
+    legacy.add_item('login', 'Original', dict(LOGIN), origin='https://example.com')
+    atomic_config_write(tmp_path / 'config.yaml', {'vault': {'store': 'floorvault'}})
+    monkeypatch.setattr('agent.safe_worker_policy.worker_config_snapshot',
+                        lambda: {'vault': {'store': 'fernet'}})
+    with pytest.raises(VaultError):
+        legacy.add_item('login', 'Frozen worker', dict(LOGIN), origin='https://example.com')
+
+
+def test_cli_preserves_legacy_if_config_save_does_not_activate(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import vault
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.delenv('APPSTATE_KEY', raising=False)
+    monkeypatch.setenv('FLOOR_VAULT_KEY', secrets.token_hex(32))
+    legacy = VaultStore()
+    item = legacy.add_item('login', 'Original', dict(LOGIN), origin='https://example.com')
+    # save_config also returns normally without writing on managed installations.
+    monkeypatch.setattr('hermes_cli.config.save_config', lambda cfg: None)
+    with pytest.raises(VaultError):
+        vault._cmd_migrate_floorvault(SimpleNamespace(remove_legacy=True))
+    assert legacy._key_path.exists()
+    assert legacy.resolve_secret(item.id)['password'] == 'hunter2-pw'
+
+
+@pytest.mark.platforms('posix')
+def test_verified_callback_holds_cross_process_legacy_lock(tmp_path):
+    import subprocess
+    import sys
+
+    legacy = VaultStore(tmp_path / 'vault')
+    legacy.add_item('login', 'Original', dict(LOGIN), origin='https://example.com')
+    target = _store(tmp_path / 'vault')
+    blocked = []
+
+    def check_lock():
+        probe = subprocess.run([sys.executable, '-c', '''
+import fcntl, sys
+with open(sys.argv[1], 'a+') as lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(0)
+sys.exit(1)
+''', str(tmp_path / 'vault' / '.vault.lock')], capture_output=True, timeout=10, check=False)
+        blocked.append(probe.returncode == 0)
+
+    assert migrate_from_fernet(legacy, target, on_verified=check_lock)['verified']
+    assert blocked == [True]

@@ -293,6 +293,10 @@ class VaultStore:
         return items if isinstance(items, list) else []
 
     def _write_all(self, items: list[dict[str, Any]]) -> None:
+        # Called under _locked(): even a writer that selected Fernet before migration must
+        # observe the config flip before it can commit or recreate deleted legacy files.
+        if configured_store_name(self._base.parent / "config.yaml") != "fernet":
+            raise VaultError("Fernet vault is no longer active; retry using the selected vault store")
         self._ensure_dir()
         payload = json.dumps({"version": 1, "items": items}).encode("utf-8")
         blob = self._fernet().encrypt(payload)
@@ -427,11 +431,17 @@ class VaultStore:
 VAULT_STORES = ("fernet", "floorvault")
 
 
-def configured_store_name() -> str:
+def configured_store_name(config_path: Optional[Path] = None) -> str:
     """``vault.store`` from config.yaml: ``fernet`` (default) or ``floorvault``."""
-    from hermes_cli.config import load_config_readonly
-
-    section = load_config_readonly().get("vault") or {}
+    if config_path is None:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+    else:
+        from hermes_cli.config_effective import load_user_config_effective
+        # Write routing belongs to the current disk state, even in a worker whose session
+        # policy intentionally remains frozen at its pre-migration configuration.
+        config = load_user_config_effective(config_path, fail_closed=True, use_worker_snapshot=False)
+    section = config.get("vault") or {}
     name = str(section.get("store") or "fernet").strip().lower() if isinstance(section, dict) else "fernet"
     if name not in VAULT_STORES:
         raise VaultError(f"unknown vault.store {name!r} (expected one of {VAULT_STORES})")

@@ -27,7 +27,8 @@ import sqlite3
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
+from urllib.parse import urlencode
 
 from agent.vault_store import VAULT_KINDS, VaultError, VaultItemMeta, VaultStore
 
@@ -154,32 +155,53 @@ def _legacy_login_secret(rec: dict[str, Any]) -> dict[str, Any]:
     if rec.get("kind") == "login":
         secret["identifier_type"] = rec.get("identifier_type")
         secret["identifier"] = rec.get("identifier")
+        otp = str(secret.get("otp_secret") or "")
+        if "|" in otp:
+            # Stored Hermes seeds already include normalized non-default parameters. Feed
+            # the dependency its supported URI input so it preserves that canonical value.
+            parts = otp.split("|")
+            if len(parts) != 4:
+                raise VaultError("legacy authenticator parameters are malformed")
+            seed, digits, period, algorithm = parts
+            query = urlencode(dict(secret=seed, digits=digits, period=period, algorithm=algorithm))
+            secret["otp_secret"] = f"otpauth://totp/Hermes?{query}"
     return secret
 
 
-def migrate_from_fernet(legacy: VaultStore, target: FloorVaultStore) -> dict[str, Any]:
+def migrate_from_fernet(legacy: VaultStore, target: FloorVaultStore, *,
+                        on_verified: Optional[Callable[[], None]] = None) -> dict[str, Any]:
     """Copy every item of a Fernet vault into *target*, keeping each item's id so existing
     ``vault_…`` handles keep resolving. Idempotent: ids already in *target* are skipped. Every
-    copied item is read back and compared before reporting success. The legacy files are never
-    modified; removing them is the caller's decision once ``verified`` is True.
-
-    The legacy lock is held across the whole copy+verify so a concurrent ``vault add``
-    cannot land between the read and the caller's ``vault.store`` flip and be stranded in
-    a vault that is no longer selected. ``created_at`` is the one field that cannot be
-    carried over — floorvault mints it on insert — so migrated items report the migration
-    time, not the original creation time."""
+    copied item is read back and compared before its authenticated retirement is recorded.
+    Retired ids are skipped even if deleted from the target, so cleanup cannot resurrect them.
+    ``on_verified`` runs under the legacy lock: the CLI flips config and optionally removes
+    legacy files there. Fernet writers recheck that config under the same lock before writing.
+    ``created_at`` is minted on insert and reports migration time."""
     with legacy._locked():
         records = legacy._read_all()
+        with _as_vault_error():
+            retired = target._store.list_legacy_retirements()
         present = {m.id for m in target.list_items()}
         copied = skipped = 0
+        verified = True
         for rec in records:
-            if rec.get("id") in present:
+            item_id = str(rec.get("id"))
+            if item_id in retired and item_id not in present:
                 skipped += 1
                 continue
-            target.add_item(str(rec.get("kind")), str(rec.get("label") or ""), _legacy_login_secret(rec),
-                            rec.get("origin"), item_id=str(rec.get("id")))
-            copied += 1
-        verified = all(_matches(target, rec) for rec in records)
+            if item_id in present:
+                skipped += 1
+            else:
+                target.add_item(str(rec.get("kind")), str(rec.get("label") or ""), _legacy_login_secret(rec),
+                                rec.get("origin"), item_id=item_id)
+                copied += 1
+            if _matches(target, rec):
+                with _as_vault_error():
+                    target._store.retire_legacy_id(item_id, item_id)
+            else:
+                verified = False
+        if verified and on_verified is not None:
+            on_verified()
     return {"total": len(records), "copied": copied, "skipped": skipped, "verified": verified}
 
 

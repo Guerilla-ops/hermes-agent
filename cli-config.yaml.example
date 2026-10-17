@@ -2345,6 +2345,8 @@ updates:
 #   generic APPSTATE_KEY variable ahead of FLOOR_VAULT_KEY — unset it if it was
 #   meant for another tool. Switch with `hermes vault migrate-floorvault`,
 #   which copies items (handles unchanged), verifies them and sets this key.
+#   Cutover serializes Fernet writers; stale writers fail and should retry.
+#   Rerunning with --remove-legacy respects items deleted after migration.
 #   To revert while vault.json.enc still exists, set store back to fernet.
 #
 # vault:

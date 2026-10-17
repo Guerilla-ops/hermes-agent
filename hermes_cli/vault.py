@@ -185,7 +185,7 @@ def _cmd_rm(args) -> None:
 
 
 def _cmd_migrate_floorvault(args) -> None:
-    from agent.vault_store import VaultStore
+    from agent.vault_store import VaultError, VaultStore, configured_store_name
     from agent.vault_store_floorvault import get_floorvault_store, migrate_from_fernet
 
     c = _console()
@@ -194,23 +194,29 @@ def _cmd_migrate_floorvault(args) -> None:
     if not legacy._vault_path.exists():
         c.print("[dim]No Fernet vault (vault.json.enc) to migrate.[/]")
         return
-    result = migrate_from_fernet(legacy, get_floorvault_store(base))
+
+    def activate() -> None:
+        from hermes_cli.config import _ensure_dict, load_config, save_config
+
+        cfg = load_config()
+        _ensure_dict(cfg, "vault")["store"] = "floorvault"
+        save_config(cfg)
+        if configured_store_name(base.parent / "config.yaml") != "floorvault":
+            raise VaultError("FloorVault was not activated; the Fernet vault is untouched. Check managed settings.")
+        if args.remove_legacy:
+            for path in (legacy._vault_path, legacy._key_path):
+                path.unlink(missing_ok=True)
+
+    result = migrate_from_fernet(legacy, get_floorvault_store(base), on_verified=activate)
     c.print(f"Copied {result['copied']} of {result['total']} items "
             f"({result['skipped']} already present) into {base / 'vault.db'}.")
     if not result["verified"]:
         c.print("[red]Verification failed:[/] the FloorVault copy does not match; the Fernet vault is untouched.")
         return
-    c.print("[green]Verified[/]: every item reads back identical from FloorVault "
+    c.print("[green]Verified[/]: newly migrated items read back identical; previously migrated ids stay retired "
             "[dim](created_at shows the migration time — the original timestamps do not carry over).[/]")
-    from hermes_cli.config import _ensure_dict, load_config, save_config
-
-    cfg = load_config()
-    _ensure_dict(cfg, "vault")["store"] = "floorvault"
-    save_config(cfg)
     c.print("vault.store is now [bold]floorvault[/].")
     if args.remove_legacy:
-        for path in (legacy._vault_path, legacy._key_path):
-            path.unlink(missing_ok=True)
         c.print("Removed vault.json.enc and vault.key.")
     else:
         c.print("[dim]vault.json.enc and vault.key were left in place; rerun with --remove-legacy "
