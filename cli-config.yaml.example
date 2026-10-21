@@ -2344,8 +2344,10 @@ updates:
 #   with neither, the vault fails closed. Env keys are checked BEFORE the OS
 #   store on every platform — a stale FLOOR_VAULT_KEY on a desktop silently
 #   overrides Keychain/DPAPI/Secret Service, so unset it once you leave the
-#   headless host. Note: floorvault also honours its generic APPSTATE_KEY
-#   variable ahead of FLOOR_VAULT_KEY — unset it if it was meant for another tool. Switch with `hermes vault migrate-floorvault`,
+#   headless host. APPSTATE_KEY is a legacy shared name
+#   and is ignored by the pinned FloorVault revision. Each profile's vault path
+#   gets a distinct keychain identity and authenticated application context.
+#   Switch with `hermes vault migrate-floorvault`,
 #   which copies items (handles unchanged), verifies them and sets this key.
 #   Cutover serializes Fernet writers; stale writers fail and should retry.
 #   Rerunning with --remove-legacy respects items deleted after migration.

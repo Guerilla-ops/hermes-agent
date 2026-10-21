@@ -68,6 +68,32 @@ def test_wrong_key_cannot_read(tmp_path):
         _store(tmp_path / "vault").resolve_secret(item.id)
 
 
+def test_database_copy_cannot_cross_hermes_profiles(tmp_path, monkeypatch):
+    # Headless profiles may intentionally share one bootstrap key; the
+    # app-instance binding must still prevent a copied database from opening.
+    key = secrets.token_hex(32)
+    monkeypatch.setenv("FLOOR_VAULT_KEY", key)
+    monkeypatch.setenv("HERMES_VAULT_KEY", key)
+    source = FloorVaultStore(tmp_path / "profile-a" / "vault")
+    item = source.add_item("login", "Example", dict(LOGIN), origin="https://example.com")
+    copied = FloorVaultStore(tmp_path / "profile-b" / "vault")
+    (copied._base / "vault.db").write_bytes((source._base / "vault.db").read_bytes())
+
+    with pytest.raises(VaultError, match="failed authentication"):
+        copied.resolve_secret(item.id)
+
+
+def test_namespaced_key_takes_precedence_over_legacy_appstate_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("APPSTATE_KEY", secrets.token_hex(32))
+    monkeypatch.setenv("FLOOR_VAULT_KEY", secrets.token_hex(32))
+    store = FloorVaultStore(tmp_path / "profile" / "vault")
+    item = store.add_item("login", "Example", dict(LOGIN), origin="https://example.com")
+
+    monkeypatch.setenv("APPSTATE_KEY", secrets.token_hex(32))
+    reopened = FloorVaultStore(tmp_path / "profile" / "vault")
+    assert reopened.resolve_secret(item.id)["password"] == LOGIN["password"]
+
+
 def test_validation_errors_are_vault_errors(tmp_path):
     store = _store(tmp_path / "vault")
     with pytest.raises(VaultError):

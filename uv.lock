@@ -1833,14 +1833,10 @@ wheels = [
 
 [[package]]
 name = "floorvault"
-version = "0.1.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.0"
+source = { git = "https://github.com/Guerilla-ops/floorvault.git?rev=ca76027dc0c46a21956e62c89ffe934263bd3c00#ca76027dc0c46a21956e62c89ffe934263bd3c00" }
 dependencies = [
     { name = "cryptography" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/a5/8d1854b162257fdef6abb9ac65a5dd3caa5085d18f18afe4ee5d304a1819/floorvault-0.1.0.tar.gz", hash = "sha256:cc40891f2a0f9d3e0643fd743cb2df8f83960911d05daa167eab9589d724adc1", size = 572165, upload-time = "2026-10-08T22:27:20.317Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e2/ea/e4772de7475eed5acd4bb4b03e84a66f8327801e1e3c6a14b51efc41a7be/floorvault-0.1.0-py3-none-any.whl", hash = "sha256:0a4cebcd4fd821d2982619670d9fecbb61e1259e9230363da4f3d81f27252eae", size = 116413, upload-time = "2026-10-08T22:27:18.855Z" },
 ]
 
 [package.optional-dependencies]
@@ -1848,7 +1844,7 @@ linux = [
     { name = "secretstorage" },
 ]
 macos = [
-    { name = "pyobjc-framework-security" },
+    { name = "pyobjc-framework-security", marker = "sys_platform == 'darwin'" },
 ]
 
 [[package]]
@@ -2376,9 +2372,7 @@ firecrawl = [
     { name = "firecrawl-py" },
 ]
 floorvault = [
-    { name = "floorvault" },
-    { name = "floorvault", extra = ["linux"], marker = "sys_platform == 'linux'" },
-    { name = "floorvault", extra = ["macos"], marker = "sys_platform == 'darwin'" },
+    { name = "floorvault", extra = ["linux", "macos"] },
 ]
 google = [
     { name = "google-api-python-client" },
@@ -2552,7 +2546,7 @@ dev = [
 test = [
     { name = "anthropic" },
     { name = "distlib", marker = "sys_platform == 'win32'" },
-    { name = "floorvault" },
+    { name = "floorvault", extra = ["linux", "macos"] },
 ]
 
 [package.metadata]
@@ -2594,9 +2588,7 @@ requires-dist = [
     { name = "firecrawl-anydoc", marker = "python_full_version >= '3.14'", specifier = "==0.2.4" },
     { name = "firecrawl-anydoc", marker = "extra == 'doc-extract'", specifier = "==0.2.4" },
     { name = "firecrawl-py", marker = "extra == 'firecrawl'", specifier = "==4.17.0" },
-    { name = "floorvault", marker = "extra == 'floorvault'", specifier = "==0.1.0" },
-    { name = "floorvault", extras = ["linux"], marker = "sys_platform == 'linux' and extra == 'floorvault'", specifier = "==0.1.0" },
-    { name = "floorvault", extras = ["macos"], marker = "sys_platform == 'darwin' and extra == 'floorvault'", specifier = "==0.1.0" },
+    { name = "floorvault", extras = ["macos", "linux"], marker = "extra == 'floorvault'", git = "https://github.com/Guerilla-ops/floorvault.git?rev=ca76027dc0c46a21956e62c89ffe934263bd3c00" },
     { name = "google-api-python-client", marker = "extra == 'google'", specifier = "==2.194.0" },
     { name = "google-auth", marker = "extra == 'google'", specifier = "==2.55.1" },
     { name = "google-auth", marker = "extra == 'vertex'", specifier = "==2.55.1" },
@@ -2734,7 +2726,7 @@ dev = [
 test = [
     { name = "anthropic", specifier = "==0.87.0" },
     { name = "distlib", marker = "sys_platform == 'win32'", specifier = "==0.4.3" },
-    { name = "floorvault", specifier = "==0.1.0" },
+    { name = "floorvault", extras = ["macos", "linux"], git = "https://github.com/Guerilla-ops/floorvault.git?rev=ca76027dc0c46a21956e62c89ffe934263bd3c00" },
 ]
 
 [[package]]

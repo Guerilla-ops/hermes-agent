@@ -27,6 +27,7 @@ keep working.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -97,20 +98,32 @@ def _convert(meta: Any) -> VaultItemMeta:
         identifier_type=meta.identifier_type, identifier=meta.identifier, has_otp=bool(meta.has_otp))
 
 
+def _profile_identity(base_dir: Path) -> tuple[str, str]:
+    """Return app-AAD and OS-custody identities bound to this vault directory."""
+    canonical = str(Path(base_dir).expanduser().resolve())
+    profile_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+    return f"{APP_INSTANCE_ID}-{profile_id}", f"{KEYRING_SERVICE}-{profile_id}"
+
+
 class FloorVaultStore:
     """Same public surface as ``VaultStore``: add_item, list_items, has_items, remove_item,
     get_meta, resolve_secret."""
 
     def __init__(self, base_dir: Path, *, crypto: Any = None):
         _require_floorvault()
-        self._base = Path(base_dir)
+        self._base = Path(base_dir).expanduser().resolve()
         with _as_vault_error():
             from floorvault import AdaptiveKeyProvider, FloorVault
             from floorvault.vaultkit.vault import VaultStore as _Store
 
             if crypto is None:
-                key = AdaptiveKeyProvider(service_name=KEYRING_SERVICE, fallback_dir=self._base).resolve_key()
-                crypto = FloorVault(key, app_instance_id=APP_INSTANCE_ID)
+                app_instance_id, service_name = _profile_identity(self._base)
+                key = AdaptiveKeyProvider(
+                    service_name=service_name,
+                    account_name="hermes-profile-v1",
+                    fallback_dir=self._base,
+                ).resolve_key()
+                crypto = FloorVault(key, app_instance_id=app_instance_id)
             self._store = _Store(self._base, crypto=crypto)
         # sqlite3.connect creates vault.db under the process umask; tighten to the vault
         # convention (0600, like vault.key). The 0700 parent dir already shields it.

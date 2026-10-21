@@ -89,6 +89,24 @@ Items live encrypted under `~/.hermes/vault/` (Fernet key + vault file, both
 visible metadata; passwords and card values never leave the vault except into
 the page.
 
+### Optional FloorVault store
+
+Operators may opt into the FloorVault-backed SQLite store with
+`vault.store: floorvault`. It uses AES-256-SIV field encryption and OS-backed
+key custody (macOS Keychain, Linux Secret Service, or Windows DPAPI); headless
+deployments can supply `FLOOR_VAULT_KEY`. Linux Secret Service support is
+installed with the FloorVault extra. Without a usable key provider, startup
+fails closed. Each profile's resolved vault directory selects a separate
+keychain identity and authenticated application context, so copying one
+profile's database into another profile does not make its records readable.
+
+On macOS and Linux, constructing a FloorVault key handle sets the process-wide
+`RLIMIT_CORE` soft and hard limits to zero when the OS permits it. This is
+permanent for that process and prevents core dumps from writing process memory
+to disk after a crash; account for this if the host relies on core dumps for
+diagnostics. `hermes vault migrate-floorvault` performs the optional store
+cutover and verifies copied entries before switching the configured backend.
+
 ## Headless sessions
 
 Cron jobs, webhooks, the API server and `hermes chat -q` have nobody to answer a
